@@ -1,0 +1,7 @@
+node_modules/
+.env
+*.log
+.DS_Store
+
+# Baileys session data (per-user credentials, jangan masuk git)
+backend/sessions/
