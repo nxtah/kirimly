@@ -1,5 +1,10 @@
 {
   "pages": {
+    "/page": [
+      "static/chunks/webpack.js",
+      "static/chunks/main-app.js",
+      "static/chunks/app/page.js"
+    ],
     "/layout": [
       "static/chunks/webpack.js",
       "static/chunks/main-app.js",
@@ -21,6 +26,11 @@
       "static/chunks/main-app.js",
       "static/chunks/app/(dashboard)/layout.js"
     ],
+    "/(dashboard)/admin/users/page": [
+      "static/chunks/webpack.js",
+      "static/chunks/main-app.js",
+      "static/chunks/app/(dashboard)/admin/users/page.js"
+    ],
     "/(dashboard)/connect-wa/page": [
       "static/chunks/webpack.js",
       "static/chunks/main-app.js",
@@ -36,25 +46,25 @@
       "static/chunks/main-app.js",
       "static/chunks/app/(dashboard)/contacts/page.js"
     ],
+    "/(dashboard)/templates/page": [
+      "static/chunks/webpack.js",
+      "static/chunks/main-app.js",
+      "static/chunks/app/(dashboard)/templates/page.js"
+    ],
     "/(dashboard)/blast/page": [
       "static/chunks/webpack.js",
       "static/chunks/main-app.js",
       "static/chunks/app/(dashboard)/blast/page.js"
-    ],
-    "/(dashboard)/blast/[id]/page": [
-      "static/chunks/webpack.js",
-      "static/chunks/main-app.js",
-      "static/chunks/app/(dashboard)/blast/[id]/page.js"
     ],
     "/(dashboard)/blast/new/page": [
       "static/chunks/webpack.js",
       "static/chunks/main-app.js",
       "static/chunks/app/(dashboard)/blast/new/page.js"
     ],
-    "/(dashboard)/logs/page": [
+    "/(dashboard)/blast/[id]/page": [
       "static/chunks/webpack.js",
       "static/chunks/main-app.js",
-      "static/chunks/app/(dashboard)/logs/page.js"
+      "static/chunks/app/(dashboard)/blast/[id]/page.js"
     ],
     "/_not-found/page": [
       "static/chunks/webpack.js",

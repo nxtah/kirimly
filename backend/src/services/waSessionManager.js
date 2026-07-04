@@ -93,9 +93,12 @@ async function startSession(userId) {
 
   const socket = makeWASocket({
     auth: state,
-    printQRInTerminal: false, // we capture QR programmatically
+    printQRInTerminal: false,
     syncFullHistory: false,
-    markOnlineOnConnect: true,
+    markOnlineOnConnect: false,
+    browser: ["Chrome", "Linux", ""],
+    connectTimeoutMs: 60000,
+    keepAliveIntervalMs: 25000,
   });
 
   // Create a promise that resolves when QR arrives or connection opens

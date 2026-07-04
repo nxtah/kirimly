@@ -6,7 +6,7 @@ import { api } from "@/lib/api";
 import DashboardLayout from "@/components/DashboardLayout";
 import ConfirmDialog from "@/components/ConfirmDialog";
 import { SkeletonTable, SkeletonCard } from "@/components/ui/Skeleton";
-import { ArrowLeft, Send, CheckCircle2, XCircle, Clock, AlertTriangle, X, Loader2, FileDown } from "lucide-react";
+import { ArrowLeft, Send, CheckCircle2, XCircle, Clock, AlertTriangle, X, Loader2, FileDown, RefreshCw } from "lucide-react";
 
 interface BlastDetail {
   id: number; name: string; template_id: number; total_contacts: number;
@@ -15,6 +15,11 @@ interface BlastDetail {
   created_at: string; sent_at: string | null; completed_at: string | null;
 }
 interface BlastMessage {
+  delivered_at?: string | null;
+  read_at?: string | null;
+  replied_at?: string | null;
+  reply_body?: string | null;
+  wave_number?: number;
   id: number; contact_id: number | null; contact_name: string | null;
   phone_number: string; message_body: string; status: string;
   error_message: string | null; sent_at: string | null;
@@ -35,6 +40,7 @@ export default function BlastProgressPage() {
   const [error, setError] = useState<string | null>(null);
   const [cancelOpen, setCancelOpen] = useState(false);
   const [cancelling, setCancelling] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const isFinal = blast?.status === "completed" || blast?.status === "cancelled";
 
@@ -59,6 +65,18 @@ export default function BlastProgressPage() {
     if (!isFinal) pollRef.current = setInterval(fetchDetail, 4000);
     return () => { if (pollRef.current) clearInterval(pollRef.current); };
   }, [fetchDetail, isFinal]);
+
+  async function handleRetry() {
+    setRetrying(true);
+    try {
+      const res = await api.post(`/api/blasts/${blastId}/retry`);
+      router.push(`/blast/${res.blast_id}`);
+    } catch (err: any) {
+      setError(err?.body?.error || "Retry failed");
+    } finally {
+      setRetrying(false);
+    }
+  }
 
   async function handleCancel() {
     setCancelling(true);

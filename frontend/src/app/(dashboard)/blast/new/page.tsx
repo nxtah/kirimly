@@ -7,15 +7,25 @@ import DashboardLayout from "@/components/DashboardLayout";
 import Modal from "@/components/Modal";
 import PageHeader from "@/components/ui/PageHeader";
 import { SkeletonTable } from "@/components/ui/Skeleton";
-import { Plus, Send, Search, AlertTriangle, FileText, Users, Clock, Waves, Trash2 } from "lucide-react";
+import { Plus, Send, Search, AlertTriangle, FileText, Users, Clock, Waves, Trash2, Gauge } from "lucide-react";
 
 interface Template { id: number; name: string; body: string; variables: string[]; }
 interface Contact { id: number; name: string; phone_number: string; }
 
 const MAX_WAVES = 3;
 const MAX_PER_WAVE = 20;
-const DELAY_PER_CONTACT_MS = 7500;
-const WAVE_DELAY_MS = 15 * 60 * 1000;
+
+const DELAY_OPTIONS = [
+  { value: 8000, label: "8 detik" },
+  { value: 15000, label: "15 detik" },
+  { value: 20000, label: "20 detik" },
+];
+
+const WAVE_DELAY_OPTIONS = [
+  { value: 300000, label: "5 menit" },
+  { value: 600000, label: "10 menit" },
+  { value: 900000, label: "15 menit" },
+];
 
 export default function NewBlastPage() {
   const router = useRouter();
@@ -34,6 +44,10 @@ export default function NewBlastPage() {
   const [mode, setMode] = useState<"instant" | "schedule">("instant");
   const [scheduledDate, setScheduledDate] = useState("");
   const [scheduledTime, setScheduledTime] = useState("");
+
+  // Delay settings
+  const [delayPerContact, setDelayPerContact] = useState(8000);
+  const [delayPerWave, setDelayPerWave] = useState(600000);
 
   useEffect(() => {
     async function init() {
@@ -67,6 +81,12 @@ export default function NewBlastPage() {
     }
   }
 
+  function selectAllFiltered() {
+    const unassigned = filteredContacts.filter((c) => !assignedIds.has(c.id));
+    if (unassigned.length === 0) return;
+    setWaves((prev) => prev.map((w, i) => (i === currentWaveIdx ? [...w, ...unassigned.map((x) => x.id)] : w)));
+  }
+
   function addWave() {
     if (waves.length >= MAX_WAVES) return;
     setWaves((prev) => [...prev, []]);
@@ -82,8 +102,8 @@ export default function NewBlastPage() {
   const totalContacts = waves.reduce((sum, w) => sum + w.length, 0);
   const totalEstimateMin = waves.reduce((sum, _, i) => {
     const msgs = waves[i].length;
-    const msgTime = msgs * DELAY_PER_CONTACT_MS;
-    const waveDelay = i > 0 ? WAVE_DELAY_MS : 0;
+    const msgTime = msgs * delayPerContact;
+    const waveDelay = i > 0 ? delayPerWave : 0;
     return sum + msgTime + waveDelay;
   }, 0);
   const totalEstimate = Math.ceil(totalEstimateMin / 60000);
@@ -93,8 +113,13 @@ export default function NewBlastPage() {
     setSending(true);
     try {
       const nonEmptyWaves = waves.filter((w) => w.length > 0).map((w) => [...w]);
-      const body: any = { template_id: selectedTemplateId, waves: nonEmptyWaves };
-      body.name = blastName.trim();
+      const body: any = {
+        template_id: selectedTemplateId,
+        waves: nonEmptyWaves,
+        name: blastName.trim(),
+        delay_per_contact_ms: delayPerContact,
+        delay_per_wave_ms: delayPerWave,
+      };
       if (mode === "schedule" && scheduledDate && scheduledTime) {
         body.scheduled_at = new Date(`${scheduledDate}T${scheduledTime}`).toISOString();
       }
@@ -222,14 +247,17 @@ export default function NewBlastPage() {
           <div className="flex items-center justify-between mb-3">
             <p className="text-sm text-ink-muted">
               Wave {currentWaveIdx + 1}: <strong className="text-ink">{currentCount}</strong> / {MAX_PER_WAVE}
-              {currentCount > 0 && <span className="ml-2 text-ink-light"><Clock size={12} className="inline" /> ~{Math.ceil((currentCount * DELAY_PER_CONTACT_MS) / 60000)} min</span>}
+              {currentCount > 0 && <span className="ml-2 text-ink-light"><Clock size={12} className="inline" /> ~{Math.ceil((currentCount * delayPerContact) / 60000)} min</span>}
             </p>
           </div>
 
-          <div className="relative mb-3">
+          <div className="relative mb-2">
             <Search size={16} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-ink-light" />
             <input type="text" value={contactSearch} onChange={(e) => setContactSearch(e.target.value)}
               placeholder="Search contacts..." className="w-full bg-white border border-gray-200 rounded-xl pl-10 pr-4 py-2.5 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-primary-500 transition-all" />
+          </div>
+          <div className="flex items-center justify-end mb-2">
+            <button onClick={selectAllFiltered} className="text-xs font-medium text-primary-600 hover:text-primary-700 transition-colors">Select All in Wave</button>
           </div>
 
           {filteredContacts.length === 0 ? (
@@ -259,10 +287,54 @@ export default function NewBlastPage() {
           )}
         </section>
 
-        {/* Schedule */}
+        {/* Delay Settings */}
         <section className="bg-surface-card rounded-2xl shadow-card p-6 mb-5">
           <div className="flex items-center gap-2 mb-4">
             <span className="flex items-center justify-center w-7 h-7 rounded-lg bg-primary-100 text-primary-700 text-xs font-bold">4</span>
+            <h2 className="text-sm font-semibold text-ink">Delay Settings</h2>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+            {/* Delay per contact */}
+            <div>
+              <label className="block text-xs font-semibold text-ink-muted mb-2 uppercase tracking-wider">Delay per Kontak</label>
+              <div className="flex flex-wrap gap-2">
+                {DELAY_OPTIONS.map((opt) => (
+                  <button key={opt.value} onClick={() => setDelayPerContact(opt.value)}
+                    className={`px-4 py-2 rounded-xl text-sm font-medium transition-all ${
+                      delayPerContact === opt.value
+                        ? "bg-primary-500 text-white shadow-sm"
+                        : "bg-gray-100 text-ink-muted hover:bg-gray-200"
+                    }`}>
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Delay per wave */}
+            <div>
+              <label className="block text-xs font-semibold text-ink-muted mb-2 uppercase tracking-wider">Delay antar Wave</label>
+              <div className="flex flex-wrap gap-2">
+                {WAVE_DELAY_OPTIONS.map((opt) => (
+                  <button key={opt.value} onClick={() => setDelayPerWave(opt.value)}
+                    className={`px-4 py-2 rounded-xl text-sm font-medium transition-all ${
+                      delayPerWave === opt.value
+                        ? "bg-primary-500 text-white shadow-sm"
+                        : "bg-gray-100 text-ink-muted hover:bg-gray-200"
+                    }`}>
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* Schedule */}
+        <section className="bg-surface-card rounded-2xl shadow-card p-6 mb-5">
+          <div className="flex items-center gap-2 mb-4">
+            <span className="flex items-center justify-center w-7 h-7 rounded-lg bg-primary-100 text-primary-700 text-xs font-bold">5</span>
             <h2 className="text-sm font-semibold text-ink">Delivery Mode</h2>
           </div>
           <div className="flex items-center gap-3 mb-4">
@@ -289,10 +361,11 @@ export default function NewBlastPage() {
 
         {/* Summary */}
         <div className="bg-surface-card rounded-2xl shadow-card p-4 mb-4">
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
-            <div><p className="text-xs text-ink-muted">Name</p><p className="font-semibold text-ink">{blastName || "(not set)"}</p></div>
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-sm">
+            <div><p className="text-xs text-ink-muted">Name</p><p className="font-semibold text-ink truncate">{blastName || "(not set)"}</p></div>
             <div><p className="text-xs text-ink-muted">Contacts</p><p className="font-semibold text-ink">{totalContacts}</p></div>
             <div><p className="text-xs text-ink-muted">Waves</p><p className="font-semibold text-ink">{waves.filter(w => w.length > 0).length}</p></div>
+            <div><p className="text-xs text-ink-muted">Delay/Kontak</p><p className="font-semibold text-ink">{delayPerContact / 1000}s</p></div>
             <div><p className="text-xs text-ink-muted">Est. Time</p><p className="font-semibold text-ink">~{totalEstimate} min</p></div>
           </div>
         </div>
@@ -301,7 +374,7 @@ export default function NewBlastPage() {
           <AlertTriangle size={18} className="text-amber-600 shrink-0 mt-0.5" />
           <div className="text-xs text-amber-800">
             <p className="font-medium">Max {MAX_PER_WAVE} contacts per wave, max {MAX_WAVES} waves per broadcast.</p>
-            <p className="mt-0.5">Each wave sent with <strong>15-20 min delay</strong> to avoid spam detection.</p>
+            <p className="mt-0.5">Delay antar wave <strong>{delayPerWave / 60000} menit</strong> & delay per kontak <strong>{delayPerContact / 1000} detik</strong> untuk hindari spam detection.</p>
           </div>
         </div>
 
@@ -316,9 +389,10 @@ export default function NewBlastPage() {
             <p>Send <strong>"{blastName}"</strong> using <strong>{selectedTemplate?.name}</strong> to <strong>{totalContacts}</strong> contact(s) in <strong>{waves.filter(w => w.length > 0).length} wave(s)</strong>?</p>
             <div className="space-y-1">
               {waves.filter(w => w.length > 0).map((w, i) => (
-                <p key={i} className="text-xs text-ink-muted">Wave {i + 1}: {w.length} contacts ~{Math.ceil((w.length * DELAY_PER_CONTACT_MS) / 60000)} min</p>
+                <p key={i} className="text-xs text-ink-muted">Wave {i + 1}: {w.length} contacts ~{Math.ceil((w.length * delayPerContact) / 60000)} min</p>
               ))}
             </div>
+            <p className="text-xs text-ink-muted">Delay per contact: {delayPerContact / 1000}s | Delay antar wave: {delayPerWave / 60000} min</p>
             <div className="flex justify-end gap-2 pt-2">
               <button onClick={() => setConfirmOpen(false)} disabled={sending}
                 className="px-4 py-2 text-sm font-medium text-ink-muted bg-gray-50 rounded-xl hover:bg-gray-100 disabled:opacity-50">Cancel</button>

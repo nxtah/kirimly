@@ -9,5 +9,6 @@ router.post('/',             authMiddleware, blastController.create);
 router.get('/:id',           authMiddleware, blastController.detail);
 router.get('/:id/messages',  authMiddleware, blastController.messages);
 router.post('/:id/cancel',   authMiddleware, blastController.cancel);
+router.post('/:id/retry',    authMiddleware, blastController.retry);
 
 module.exports = router;

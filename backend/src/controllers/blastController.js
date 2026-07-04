@@ -3,7 +3,7 @@ const blastService = require('../services/blastService');
 // ── POST /api/blasts ──
 async function create(req, res) {
   const userId = req.user.user_id;
-  const { template_id, waves, scheduled_at, name } = req.body;
+  const { template_id, waves, scheduled_at, name, delay_per_contact_ms, delay_per_wave_ms } = req.body;
 
   if (!template_id) {
     return res.status(400).json({ error: 'template_id is required' });
@@ -13,7 +13,7 @@ async function create(req, res) {
   }
 
   try {
-    const blast = await blastService.startBlast(userId, template_id, waves, scheduled_at || null, name || null);
+    const blast = await blastService.startBlast(userId, template_id, waves, scheduled_at || null, name || null, delay_per_contact_ms || null, delay_per_wave_ms || null);
 
     res.status(201).json({
       message: blast.scheduled_at ? 'Blast scheduled' : 'Blast started',
@@ -127,4 +127,31 @@ async function cancel(req, res) {
   }
 }
 
-module.exports = { create, list, detail, messages, cancel };
+
+// ── POST /api/blasts/:id/retry ──
+async function retry(req, res) {
+  const userId = req.user.user_id;
+  const blastId = parseInt(req.params.id, 10);
+
+  if (isNaN(blastId)) {
+    return res.status(400).json({ error: 'Invalid blast ID' });
+  }
+
+  try {
+    const blast = await blastService.retryFailed(blastId, userId);
+    res.status(201).json({
+      message: 'Retry started',
+      blast_id: blast.id,
+      total_contacts: blast.total_contacts,
+      status: blast.status,
+    });
+  } catch (err) {
+    if (err.statusCode) {
+      return res.status(err.statusCode).json({ error: err.message });
+    }
+    console.error('Retry blast error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+module.exports = { create, list, detail, messages, cancel, retry };

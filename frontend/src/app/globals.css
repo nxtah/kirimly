@@ -1,7 +1,15 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@1&display=swap');
 
 body {
-  @apply bg-surface text-ink antialiased;
+  @apply bg-white text-gray-900 antialiased;
+  font-family: var(--font-sans), system-ui, sans-serif;
+}
+
+.font-serif-italic {
+  font-family: 'Instrument Serif', Georgia, serif;
+  font-style: italic;
+  font-weight: 400;
 }

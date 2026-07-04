@@ -14,10 +14,10 @@ const cancelledBlasts = new Set();
 const activeProcessors = new Map();
 
 // ── Read delays from env with defaults ──
-const DELAY_MIN = parseInt(process.env.BLAST_DELAY_MIN_MS, 10) || 5000;
-const DELAY_MAX = parseInt(process.env.BLAST_DELAY_MAX_MS, 10) || 10000;
-const WAVE_DELAY_MIN = parseInt(process.env.BLAST_WAVE_DELAY_MIN_MS, 10) || 900000; // 15min
-const WAVE_DELAY_MAX = parseInt(process.env.BLAST_WAVE_DELAY_MAX_MS, 10) || 1200000; // 20min
+let DELAY_MIN = parseInt(process.env.BLAST_DELAY_MIN_MS, 10) || 5000;
+let DELAY_MAX = parseInt(process.env.BLAST_DELAY_MAX_MS, 10) || 10000;
+let WAVE_DELAY_MIN = parseInt(process.env.BLAST_WAVE_DELAY_MIN_MS, 10) || 900000; // 15min
+let WAVE_DELAY_MAX = parseInt(process.env.BLAST_WAVE_DELAY_MAX_MS, 10) || 1200000; // 20min
 const MAX_WAVES = parseInt(process.env.BLAST_MAX_WAVES, 10) || 3;
 const MAX_PER_WAVE = parseInt(process.env.BLAST_MAX_PER_WAVE, 10) || 20;
 
@@ -75,12 +75,23 @@ async function markOrphanedBlasts() {
  * @param {string|null} scheduledAt — ISO timestamp, or null for instant
  * @returns {Promise<object>} the created blast row
  */
-async function startBlast(userId, templateId, waves, scheduledAt = null, blastName = null) {
+async function startBlast(userId, templateId, waves, scheduledAt = null, blastName = null, delayPerContactMs = null, delayPerWaveMs = null) {
   // 1. Validate WA socket is connected
-  if (!waSessionManager.isConnected(userId)) {
+  if (process.env.NODE_ENV !== 'development' && !waSessionManager.isConnected(userId)) {
     const err = new Error('WhatsApp session is not connected');
     err.statusCode = 400;
     throw err;
+  }
+
+  
+  // Override delays with user-specified values
+  if (delayPerContactMs) {
+    DELAY_MIN = parseInt(delayPerContactMs, 10);
+    DELAY_MAX = parseInt(delayPerContactMs, 10);
+  }
+  if (delayPerWaveMs) {
+    WAVE_DELAY_MIN = parseInt(delayPerWaveMs, 10);
+    WAVE_DELAY_MAX = parseInt(delayPerWaveMs, 10);
   }
 
   // 2. Validate waves
@@ -551,8 +562,69 @@ async function getLogs(userId, filters) {
   };
 }
 
+
+/**
+ * Create a new blast retrying only failed messages from a previous blast.
+ */
+async function retryFailed(originalBlastId, userId) {
+  // 1. Get original blast
+  const { rows: blastRows } = await pool.query(
+    'SELECT * FROM blasts WHERE id = $1 AND user_id = $2',
+    [originalBlastId, userId]
+  );
+  if (blastRows.length === 0) {
+    const err = new Error('Blast not found');
+    err.statusCode = 404;
+    throw err;
+  }
+  const original = blastRows[0];
+
+  // 2. Get failed messages
+  const { rows: failedMessages } = await pool.query(
+    `SELECT bm.contact_id, bm.phone_number, bm.message_body FROM blast_messages bm WHERE bm.blast_id = $1 AND bm.status = 'failed'`,
+    [originalBlastId]
+  );
+  if (failedMessages.length === 0) {
+    const err = new Error('No failed messages to retry');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  // 3. Create new blast
+  const numWaves = 1; // retry as single wave
+  const { rows: newBlastRows } = await pool.query(
+    `INSERT INTO blasts (user_id, template_id, name, total_contacts, status, sent_count, failed_count) VALUES ($1, $2, $3, $4, 'sending', 0, 0) RETURNING *`,
+    [userId, original.template_id, original.name + ' (Retry)', failedMessages.length]
+  );
+  const newBlast = newBlastRows[0];
+
+  // 4. Create blast_messages for failed contacts
+  let idx = 0;
+  const values = [];
+  const params = [newBlast.id];
+  for (const m of failedMessages) {
+    const base = idx * 4;
+    values.push('($1, $' + (base + 2) + ', $' + (base + 3) + ', $' + (base + 4) + ", 'pending', NOW(), 1)");
+    params.push(m.contact_id, m.phone_number, m.message_body);
+    idx++;
+  }
+
+  await pool.query(
+    "INSERT INTO blast_messages (blast_id, contact_id, phone_number, message_body, status, created_at, wave_number) VALUES " + values.join(', '),
+    params
+  );
+
+  // 5. Process
+  processBlastWaves(newBlast.id, userId, numWaves).catch(err => {
+    console.error('Retry blast #' + newBlast.id + ' error:', err);
+  });
+
+  return newBlast;
+}
+
 module.exports = {
   startBlast,
+  retryFailed,
   cancelBlast,
   markOrphanedBlasts,
   getBlast,
