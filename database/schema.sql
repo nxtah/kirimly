@@ -87,23 +87,25 @@ CREATE INDEX idx_templates_category  ON templates(category);
 
 -- 6. BLASTS (riwayat pengiriman broadcast)
 CREATE TABLE blasts (
-    id              SERIAL PRIMARY KEY,
-    user_id         INTEGER      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    template_id     INTEGER      REFERENCES templates(id) ON DELETE SET NULL,
-    name            VARCHAR(150),
-    total_contacts  INTEGER      NOT NULL DEFAULT 0,
-    sent_count      INTEGER      NOT NULL DEFAULT 0,
-    delivered_count INTEGER      NOT NULL DEFAULT 0,
-    read_count      INTEGER      NOT NULL DEFAULT 0,
-    replied_count   INTEGER      NOT NULL DEFAULT 0,
-    failed_count    INTEGER      NOT NULL DEFAULT 0,
-    status          VARCHAR(20)  NOT NULL DEFAULT 'draft'
-                    CHECK (status IN ('draft', 'scheduled', 'sending', 'completed', 'cancelled')),
-    scheduled_at    TIMESTAMPTZ,
-    sent_at         TIMESTAMPTZ,
-    completed_at    TIMESTAMPTZ,
-    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    id                  SERIAL PRIMARY KEY,
+    user_id             INTEGER      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    template_id         INTEGER      REFERENCES templates(id) ON DELETE SET NULL,
+    name                VARCHAR(150),
+    total_contacts      INTEGER      NOT NULL DEFAULT 0,
+    sent_count          INTEGER      NOT NULL DEFAULT 0,
+    delivered_count     INTEGER      NOT NULL DEFAULT 0,
+    read_count          INTEGER      NOT NULL DEFAULT 0,
+    replied_count       INTEGER      NOT NULL DEFAULT 0,
+    failed_count        INTEGER      NOT NULL DEFAULT 0,
+    status              VARCHAR(20)  NOT NULL DEFAULT 'draft'
+                        CHECK (status IN ('draft', 'scheduled', 'sending', 'completed', 'cancelled')),
+    scheduled_at        TIMESTAMPTZ,
+    sent_at             TIMESTAMPTZ,
+    completed_at        TIMESTAMPTZ,
+    delay_per_contact_ms INTEGER,   -- user-specified delay between messages (null = use env default)
+    delay_per_wave_ms    INTEGER,   -- user-specified delay between waves (null = use env default)
+    created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX idx_blasts_user_id   ON blasts(user_id);

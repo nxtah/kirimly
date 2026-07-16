@@ -80,9 +80,9 @@ async function flushQueue(userId) {
   }
 }
 
-// Periodic flush for all non-empty queues
+// Periodic flush for all non-empty queues (snapshot keys to avoid live-iterator races)
 setInterval(() => {
-  for (const userId of flushQueues.keys()) {
+  for (const userId of [...flushQueues.keys()]) {
     flushQueue(userId).catch((err) => {
       console.error(`Flush queue error for user ${userId}:`, err);
     });

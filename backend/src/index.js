@@ -24,7 +24,8 @@ app.listen(PORT, () => {
 
   // Mark any blasts stuck in 'sending' status as failed (server restart)
   markOrphanedBlasts().catch((err) => {
-    console.error('Orphan blast cleanup error:', err);
+    if (err.code === 'ECONNREFUSED') console.warn('Orphan cleanup: DB not reachable');
+    else console.error('Orphan blast cleanup error:', err);
   });
 
   // Poll for scheduled blasts every 30 seconds

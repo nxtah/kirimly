@@ -12,16 +12,19 @@ const waSessionManager = require('./waSessionManager');
 const cancelledBlasts = new Set();
 // Track active processing loops keyed by blastId
 const activeProcessors = new Map();
+// Debounce DB-down log spam
+let _dbDownLogged = false;
 
-// ── Read delays from env with defaults ──
-let DELAY_MIN = parseInt(process.env.BLAST_DELAY_MIN_MS, 10) || 5000;
-let DELAY_MAX = parseInt(process.env.BLAST_DELAY_MAX_MS, 10) || 10000;
-let WAVE_DELAY_MIN = parseInt(process.env.BLAST_WAVE_DELAY_MIN_MS, 10) || 900000; // 15min
-let WAVE_DELAY_MAX = parseInt(process.env.BLAST_WAVE_DELAY_MAX_MS, 10) || 1200000; // 20min
+// ── Read delays from env with defaults (read-only — never mutate) ──
+const DELAY_MIN = parseInt(process.env.BLAST_DELAY_MIN_MS, 10) || 5000;
+const DELAY_MAX = parseInt(process.env.BLAST_DELAY_MAX_MS, 10) || 10000;
+const WAVE_DELAY_MIN = parseInt(process.env.BLAST_WAVE_DELAY_MIN_MS, 10) || 900000; // 15min
+const WAVE_DELAY_MAX = parseInt(process.env.BLAST_WAVE_DELAY_MAX_MS, 10) || 1200000; // 20min
 const MAX_WAVES = parseInt(process.env.BLAST_MAX_WAVES, 10) || 3;
 const MAX_PER_WAVE = parseInt(process.env.BLAST_MAX_PER_WAVE, 10) || 20;
 
-function randomDelay() {
+function getContactDelay(fixedMs) {
+  if (fixedMs) return fixedMs;
   return Math.floor(Math.random() * (DELAY_MAX - DELAY_MIN + 1)) + DELAY_MIN;
 }
 
@@ -83,17 +86,6 @@ async function startBlast(userId, templateId, waves, scheduledAt = null, blastNa
     throw err;
   }
 
-  
-  // Override delays with user-specified values
-  if (delayPerContactMs) {
-    DELAY_MIN = parseInt(delayPerContactMs, 10);
-    DELAY_MAX = parseInt(delayPerContactMs, 10);
-  }
-  if (delayPerWaveMs) {
-    WAVE_DELAY_MIN = parseInt(delayPerWaveMs, 10);
-    WAVE_DELAY_MAX = parseInt(delayPerWaveMs, 10);
-  }
-
   // 2. Validate waves
   if (!Array.isArray(waves) || waves.length === 0 || waves.length > MAX_WAVES) {
     const err = new Error(`Waves must be 1-${MAX_WAVES} arrays of contact IDs`);
@@ -141,12 +133,12 @@ async function startBlast(userId, templateId, waves, scheduledAt = null, blastNa
   const isScheduled = !!scheduledAt;
   const blastStatus = isScheduled ? 'scheduled' : 'sending';
 
-  // 4. Create blast record
+  // 4. Create blast record (with delay columns for scheduled blast persistence)
   const { rows: blastRows } = await pool.query(
-    `INSERT INTO blasts (user_id, template_id, name, total_contacts, status, sent_count, failed_count, scheduled_at)
-     VALUES ($1, $2, $3, $4, $5, 0, 0, $6)
+    `INSERT INTO blasts (user_id, template_id, name, total_contacts, status, sent_count, failed_count, scheduled_at, delay_per_contact_ms, delay_per_wave_ms)
+     VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $8)
      RETURNING *`,
-    [userId, templateId, blastName || template.name, totalContacts, blastStatus, scheduledAt]
+    [userId, templateId, blastName || template.name, totalContacts, blastStatus, scheduledAt, delayPerContactMs, delayPerWaveMs]
   );
   const blast = blastRows[0];
 
@@ -176,7 +168,7 @@ async function startBlast(userId, templateId, waves, scheduledAt = null, blastNa
 
   // 6. Kick off async processor (only for instant, not scheduled)
   if (!isScheduled) {
-    processBlastWaves(blast.id, userId, numWaves).catch((err) => {
+    processBlastWaves(blast.id, userId, numWaves, delayPerContactMs, delayPerWaveMs).catch((err) => {
       console.error(`Blast #${blast.id} processor error:`, err);
     });
   }
@@ -232,7 +224,8 @@ async function cancelBlast(blastId, userId) {
 
 /* ───────────────────── async processor ───────────────────── */
 
-function randomWaveDelay() {
+function getWaveDelay(fixedMs) {
+  if (fixedMs) return fixedMs;
   return Math.floor(Math.random() * (WAVE_DELAY_MAX - WAVE_DELAY_MIN + 1)) + WAVE_DELAY_MIN;
 }
 
@@ -242,7 +235,7 @@ function randomWaveDelay() {
  * Between waves: random 15-20min delay.
  * Runs asynchronously — never awaited by the controller.
  */
-async function processBlastWaves(blastId, userId, numWaves) {
+async function processBlastWaves(blastId, userId, numWaves, contactDelayMs = null, waveDelayMs = null) {
   let cancelled = false;
 
   const abortPromise = new Promise((resolve) => {
@@ -271,7 +264,7 @@ async function processBlastWaves(blastId, userId, numWaves) {
 
       // Wait for inter-wave delay (skip for first wave)
       if (wave > 1) {
-        const waveDelay = randomWaveDelay();
+        const waveDelay = getWaveDelay(waveDelayMs);
         const raceResult = await Promise.race([
           sleep(waveDelay).then(() => 'delay'),
           abortPromise.then(() => 'abort'),
@@ -298,13 +291,20 @@ async function processBlastWaves(blastId, userId, numWaves) {
           break;
         }
 
-        const delay = randomDelay();
+        const delay = getContactDelay(contactDelayMs);
         const raceResult = await Promise.race([
           sleep(delay).then(() => 'delay'),
           abortPromise.then(() => 'abort'),
         ]);
 
         if (raceResult === 'abort' || cancelledBlasts.has(blastId)) {
+          cancelled = true;
+          await failRemaining(blastId, 'Cancelled by user');
+          break;
+        }
+
+        // Final cancellation check before sending
+        if (cancelledBlasts.has(blastId)) {
           cancelled = true;
           await failRemaining(blastId, 'Cancelled by user');
           break;
@@ -382,7 +382,7 @@ async function failRemaining(blastId, reason) {
 async function processScheduledBlasts() {
   try {
     const { rows: dueBlasts } = await pool.query(
-      `SELECT id, user_id FROM blasts
+      `SELECT id, user_id, delay_per_contact_ms, delay_per_wave_ms FROM blasts
        WHERE status = 'scheduled' AND scheduled_at <= NOW()
        LIMIT 10`
     );
@@ -400,7 +400,7 @@ async function processScheduledBlasts() {
         [b.id]
       );
 
-      processBlastWaves(b.id, b.user_id, waveRows.length).catch((err) => {
+      processBlastWaves(b.id, b.user_id, waveRows.length, b.delay_per_contact_ms, b.delay_per_wave_ms).catch((err) => {
         console.error(`Scheduled blast #${b.id} error:`, err);
       });
     }
@@ -409,7 +409,11 @@ async function processScheduledBlasts() {
       console.log(`Scheduler: started ${dueBlasts.length} scheduled blast(s)`);
     }
   } catch (err) {
-    console.error('Scheduler error:', err);
+    if (err.code === 'ECONNREFUSED') {
+      if (!_dbDownLogged) { console.warn('Scheduler: DB not reachable — skipping'); _dbDownLogged = true; }
+    } else {
+      console.error('Scheduler error:', err);
+    }
   }
 }
 
@@ -590,11 +594,11 @@ async function retryFailed(originalBlastId, userId) {
     throw err;
   }
 
-  // 3. Create new blast
+  // 3. Create new blast (inherit delay settings from original blast)
   const numWaves = 1; // retry as single wave
   const { rows: newBlastRows } = await pool.query(
-    `INSERT INTO blasts (user_id, template_id, name, total_contacts, status, sent_count, failed_count) VALUES ($1, $2, $3, $4, 'sending', 0, 0) RETURNING *`,
-    [userId, original.template_id, original.name + ' (Retry)', failedMessages.length]
+    `INSERT INTO blasts (user_id, template_id, name, total_contacts, status, sent_count, failed_count, delay_per_contact_ms, delay_per_wave_ms) VALUES ($1, $2, $3, $4, 'sending', 0, 0, $5, $6) RETURNING *`,
+    [userId, original.template_id, original.name + ' (Retry)', failedMessages.length, original.delay_per_contact_ms, original.delay_per_wave_ms]
   );
   const newBlast = newBlastRows[0];
 
@@ -615,7 +619,7 @@ async function retryFailed(originalBlastId, userId) {
   );
 
   // 5. Process
-  processBlastWaves(newBlast.id, userId, numWaves).catch(err => {
+  processBlastWaves(newBlast.id, userId, numWaves, newBlast.delay_per_contact_ms, newBlast.delay_per_wave_ms).catch(err => {
     console.error('Retry blast #' + newBlast.id + ' error:', err);
   });
 
@@ -631,6 +635,6 @@ module.exports = {
   getBlastsByUser,
   getBlastMessages,
   getLogs,
-  randomDelay,
+  getContactDelay,
   processScheduledBlasts,
 };

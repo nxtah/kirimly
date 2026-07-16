@@ -227,18 +227,40 @@ async function restoreAllSessions() {
 
   if (userIds.length === 0) return;
 
-  console.log(`Restoring ${userIds.length} WhatsApp session(s)…`);
+  // Filter out sessions for users that no longer exist
+  const { rows: validUsers } = await pool.query(
+    'SELECT id FROM users WHERE id = ANY($1::int[])',
+    [userIds]
+  );
+  const validIds = new Set(validUsers.map((r) => r.id));
+
+  const toClean = userIds.filter((uid) => !validIds.has(uid));
+  for (const uid of toClean) {
+    try {
+      const dir = sessionDir(uid);
+      if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+      await pool.query('DELETE FROM wa_sessions WHERE user_id = $1', [uid]);
+    } catch {}
+  }
+  if (toClean.length > 0) {
+    console.log(`  Cleaned ${toClean.length} orphaned session(s):`, toClean);
+  }
+
+  const toRestore = userIds.filter((uid) => validIds.has(uid));
+  if (toRestore.length === 0) return;
+
+  console.log(`Restoring ${toRestore.length} WhatsApp session(s)…`);
 
   const results = await Promise.allSettled(
-    userIds.map((uid) => startSession(uid))
+    toRestore.map((uid) => startSession(uid))
   );
 
   let ok = 0;
   results.forEach((r, i) => {
     if (r.status === 'fulfilled') ok++;
-    else console.error(`  Session ${userIds[i]} restore failed:`, r.reason?.message);
+    else console.error(`  Session ${toRestore[i]} restore failed:`, r.reason?.message);
   });
-  console.log(`  ${ok}/${userIds.length} sessions restored.`);
+  console.log(`  ${ok}/${toRestore.length} sessions restored.`);
 }
 
 /**

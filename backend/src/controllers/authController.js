@@ -22,12 +22,6 @@ async function login(req, res) {
     const user = rows[0];
 
     if (!user) {
-      // Catat failed login — user not found (tidak spesifik untuk keamanan)
-      await pool.query(
-        `INSERT INTO login_logs (user_id, ip_address, user_agent, success, fail_reason)
-         VALUES ($1, $2, $3, false, 'invalid_credentials')`,
-        [0, ipAddress, userAgent] // user_id 0 = anonymous attempt
-      );
       return res.status(401).json({ error: 'Invalid username or password' });
     }
 
