@@ -27,6 +27,7 @@ const sessions = new Map();
 const reconnectAttempts = new Map();
 const reconnectTimers = new Map(); // userId → pending reconnect timeout
 const MAX_RECONNECTS = 5;
+const STABLE_CONNECTION_MS = 10_000; // how long 'open' must last before we consider it a real recovery
 
 // WhatsApp rejects clients that announce an outdated Web version (Baileys' bundled one goes stale),
 // so fetch the current one and cache it.
@@ -173,7 +174,12 @@ async function startSession(userId) {
 
     // ── Connected ──
     if (connection === 'open') {
-      reconnectAttempts.delete(userId);
+      // Don't clear the reconnect budget yet — WhatsApp can report 'open' for a moment
+      // before immediately closing again (e.g. a stream conflict from a stale connection
+      // that hasn't been cleaned up server-side yet). Only a connection that STAYS open
+      // for a while counts as "actually recovered" (checked in the close handler below);
+      // otherwise a flapping connection would keep resetting the counter and retry forever.
+      entry.openedAt = Date.now();
       entry.status = 'connected';
       const phone = socket.user?.id
         ? socket.user.id.split(':')[0]
@@ -219,6 +225,12 @@ async function startSession(userId) {
 
       // Reconnect unless explicitly terminated — with backoff, and give up after MAX_RECONNECTS
       if (!isExpired && reason !== DisconnectReason.loggedOut) {
+        // Only treat this as a "fresh" failure streak (reset budget) if the connection was
+        // actually stable for a while before dropping — otherwise a rapid open/close loop
+        // (e.g. a stream conflict) would reset the counter every time and never give up.
+        const wasStable = entry.openedAt && Date.now() - entry.openedAt >= STABLE_CONNECTION_MS;
+        if (wasStable) reconnectAttempts.delete(userId);
+
         const attempt = (reconnectAttempts.get(userId) || 0) + 1;
         reconnectAttempts.set(userId, attempt);
         console.warn(`Session ${userId} closed (code ${reason}), reconnect attempt ${attempt}/${MAX_RECONNECTS}`);
