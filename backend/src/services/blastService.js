@@ -28,8 +28,14 @@ function getContactDelay(fixedMs) {
   return Math.floor(Math.random() * (DELAY_MAX - DELAY_MIN + 1)) + DELAY_MIN;
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/**
+ * Sleep for `ms`, or until `abortPromise` resolves. Resolves 'delay' or 'abort'.
+ * The timer is cleared on abort so cancelled blasts don't leave timers behind.
+ */
+function sleepOrAbort(ms, abortPromise) {
+  let timer;
+  const delay = new Promise((resolve) => { timer = setTimeout(() => resolve('delay'), ms); });
+  return Promise.race([delay, abortPromise.then(() => 'abort')]).finally(() => clearTimeout(timer));
 }
 
 /* ───────────────────── helpers ───────────────────── */
@@ -52,6 +58,14 @@ function personalizeBody(body, contact) {
   });
 }
 
+function assertConnected(userId) {
+  if (!waSessionManager.isConnected(userId)) {
+    const err = new Error('WhatsApp session is not connected');
+    err.statusCode = 400;
+    throw err;
+  }
+}
+
 /* ───────────────────── orphan cleanup ───────────────────── */
 
 /**
@@ -59,6 +73,14 @@ function personalizeBody(body, contact) {
  * are marked as cancelled — we can't safely resume them.
  */
 async function markOrphanedBlasts() {
+  // Their unsent messages can never be delivered now — fail them so counts stay consistent
+  await pool.query(
+    `UPDATE blast_messages
+     SET status = 'failed', error_message = 'Server restarted'
+     WHERE status = 'pending'
+       AND blast_id IN (SELECT id FROM blasts WHERE status = 'sending')`
+  );
+
   const { rowCount } = await pool.query(
     `UPDATE blasts SET status = 'cancelled', updated_at = NOW()
      WHERE status = 'sending'`
@@ -80,11 +102,7 @@ async function markOrphanedBlasts() {
  */
 async function startBlast(userId, templateId, waves, scheduledAt = null, blastName = null, delayPerContactMs = null, delayPerWaveMs = null) {
   // 1. Validate WA socket is connected
-  if (process.env.NODE_ENV !== 'development' && !waSessionManager.isConnected(userId)) {
-    const err = new Error('WhatsApp session is not connected');
-    err.statusCode = 400;
-    throw err;
-  }
+  assertConnected(userId);
 
   // 2. Validate waves
   if (!Array.isArray(waves) || waves.length === 0 || waves.length > MAX_WAVES) {
@@ -100,13 +118,14 @@ async function startBlast(userId, templateId, waves, scheduledAt = null, blastNa
     }
   }
 
-  const allContactIds = waves.flat();
+  const allContactIds = waves.flat().map(Number).filter(Number.isInteger);
 
-  // 3. Fetch template + contacts (ownership enforced by SQL WHERE user_id)
+  // 3. Fetch template + contacts (ownership enforced by SQL WHERE user_id; blocked contacts are skipped)
   const [templRes, contactsRes] = await Promise.all([
     pool.query('SELECT * FROM templates WHERE id = $1 AND user_id = $2', [templateId, userId]),
     pool.query(
-      'SELECT id, name, phone_number, notes FROM contacts WHERE id = ANY($1::int[]) AND user_id = $2',
+      `SELECT id, name, phone_number, notes FROM contacts
+       WHERE id = ANY($1::int[]) AND user_id = $2 AND is_blocked = FALSE`,
       [allContactIds, userId]
     ),
   ]);
@@ -128,8 +147,18 @@ async function startBlast(userId, templateId, waves, scheduledAt = null, blastNa
   const contactMap = {};
   for (const c of contactsRes.rows) contactMap[c.id] = c;
 
-  const totalContacts = allContactIds.length;
-  const numWaves = waves.length;
+  // Drop unknown/blocked/duplicate contacts, then drop waves that became empty and renumber
+  const seen = new Set();
+  const cleanWaves = waves
+    .map((wave) => wave.map(Number).filter((id) => {
+      if (!contactMap[id] || seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    }))
+    .filter((wave) => wave.length > 0);
+
+  const totalContacts = seen.size;
+  const numWaves = cleanWaves.length;
   const isScheduled = !!scheduledAt;
   const blastStatus = isScheduled ? 'scheduled' : 'sending';
 
@@ -146,10 +175,9 @@ async function startBlast(userId, templateId, waves, scheduledAt = null, blastNa
   let insertIdx = 0;
   const values = [];
   const flatParams = [blast.id];
-  for (let w = 0; w < waves.length; w++) {
-    for (const cId of waves[w]) {
+  for (let w = 0; w < cleanWaves.length; w++) {
+    for (const cId of cleanWaves[w]) {
       const c = contactMap[cId];
-      if (!c) continue;
       const body = personalizeBody(template.body, c);
       const base = insertIdx * 4;
       values.push(`($1, $${base + 2}, $${base + 3}, $${base + 4}, 'pending', NOW(), $${base + 5})`);
@@ -200,12 +228,12 @@ async function cancelBlast(blastId, userId) {
     throw err;
   }
 
-  // Signal cancellation (the running processor checks this set)
-  cancelledBlasts.add(blastId);
-
-  // Also kill the active processor loop if it exists
+  // Signal cancellation to the running processor (if any) and wake it from its sleep
   const abort = activeProcessors.get(blastId);
-  if (abort) abort();
+  if (abort) {
+    cancelledBlasts.add(blastId);
+    abort();
+  }
 
   // Mark as cancelled in DB (only if still in a cancellable state — TOCTOU safe)
   const { rowCount } = await pool.query(
@@ -218,6 +246,9 @@ async function cancelBlast(blastId, userId) {
     // Blast status changed between the SELECT and UPDATE — already done
     return { cancelled: false, reason: `Blast already completed` };
   }
+
+  // No processor running (e.g. still scheduled) → nobody else will clean up the pending messages
+  if (!abort) await failRemaining(blastId, 'Cancelled by user');
 
   return { cancelled: true };
 }
@@ -245,7 +276,8 @@ async function processBlastWaves(blastId, userId, numWaves, contactDelayMs = nul
   const socket = waSessionManager.getSocket(userId);
   if (!socket) {
     console.error(`Blast #${blastId}: no socket for user ${userId}`);
-    await failRemaining(blastId, 'Socket unavailable');
+    await abortBlast(blastId, 'Socket unavailable');
+    activeProcessors.delete(blastId);
     return;
   }
 
@@ -265,10 +297,7 @@ async function processBlastWaves(blastId, userId, numWaves, contactDelayMs = nul
       // Wait for inter-wave delay (skip for first wave)
       if (wave > 1) {
         const waveDelay = getWaveDelay(waveDelayMs);
-        const raceResult = await Promise.race([
-          sleep(waveDelay).then(() => 'delay'),
-          abortPromise.then(() => 'abort'),
-        ]);
+        const raceResult = await sleepOrAbort(waveDelay, abortPromise);
         if (raceResult === 'abort' || cancelledBlasts.has(blastId)) {
           cancelled = true;
           await failRemaining(blastId, 'Cancelled by user');
@@ -292,10 +321,7 @@ async function processBlastWaves(blastId, userId, numWaves, contactDelayMs = nul
         }
 
         const delay = getContactDelay(contactDelayMs);
-        const raceResult = await Promise.race([
-          sleep(delay).then(() => 'delay'),
-          abortPromise.then(() => 'abort'),
-        ]);
+        const raceResult = await sleepOrAbort(delay, abortPromise);
 
         if (raceResult === 'abort' || cancelledBlasts.has(blastId)) {
           cancelled = true;
@@ -326,6 +352,11 @@ async function processBlastWaves(blastId, userId, numWaves, contactDelayMs = nul
             `UPDATE blasts SET sent_count = $1, updated_at = NOW() WHERE id = $2`,
             [sentCount, blastId]
           );
+          await pool.query(
+            `UPDATE contacts SET last_sent_at = NOW()
+             WHERE user_id = $1 AND phone_number = $2`,
+            [userId, msg.phone_number]
+          );
         } catch (sendErr) {
           await pool.query(
             `UPDATE blast_messages SET status = 'failed', error_message = $1, sent_at = NOW()
@@ -354,7 +385,7 @@ async function processBlastWaves(blastId, userId, numWaves, contactDelayMs = nul
     }
   } catch (err) {
     console.error(`Blast #${blastId} processor error:`, err);
-    await failRemaining(blastId, 'Internal error');
+    await abortBlast(blastId, 'Internal error').catch(() => {});
   } finally {
     cancelledBlasts.delete(blastId);
     activeProcessors.delete(blastId);
@@ -370,6 +401,25 @@ async function failRemaining(blastId, reason) {
      SET status = 'failed', error_message = $1
      WHERE blast_id = $2 AND status = 'pending'`,
     [reason, blastId]
+  );
+  await pool.query(
+    `UPDATE blasts
+     SET failed_count = (SELECT COUNT(*) FROM blast_messages WHERE blast_id = $1 AND status = 'failed'),
+         updated_at = NOW()
+     WHERE id = $1`,
+    [blastId]
+  );
+}
+
+/**
+ * Stop a blast that cannot continue: fail what's left and don't leave it stuck in 'sending'.
+ */
+async function abortBlast(blastId, reason) {
+  await failRemaining(blastId, reason);
+  await pool.query(
+    `UPDATE blasts SET status = 'cancelled', updated_at = NOW()
+     WHERE id = $1 AND status = 'sending'`,
+    [blastId]
   );
 }
 
@@ -387,26 +437,31 @@ async function processScheduledBlasts() {
        LIMIT 10`
     );
 
+    let started = 0;
     for (const b of dueBlasts) {
       // Count waves for this blast
       const { rows: waveRows } = await pool.query(
-        `SELECT DISTINCT wave_number FROM blast_messages
-         WHERE blast_id = $1 ORDER BY wave_number ASC`,
+        `SELECT COALESCE(MAX(wave_number), 1)::int AS num_waves FROM blast_messages
+         WHERE blast_id = $1`,
         [b.id]
       );
+
+      // Session not connected right now → leave it scheduled and retry on the next tick
+      if (!waSessionManager.isConnected(b.user_id)) continue;
 
       await pool.query(
         `UPDATE blasts SET status = 'sending', updated_at = NOW() WHERE id = $1`,
         [b.id]
       );
 
-      processBlastWaves(b.id, b.user_id, waveRows.length, b.delay_per_contact_ms, b.delay_per_wave_ms).catch((err) => {
+      started++;
+      processBlastWaves(b.id, b.user_id, waveRows[0].num_waves, b.delay_per_contact_ms, b.delay_per_wave_ms).catch((err) => {
         console.error(`Scheduled blast #${b.id} error:`, err);
       });
     }
 
-    if (dueBlasts.length > 0) {
-      console.log(`Scheduler: started ${dueBlasts.length} scheduled blast(s)`);
+    if (started > 0) {
+      console.log(`Scheduler: started ${started} scheduled blast(s)`);
     }
   } catch (err) {
     if (err.code === 'ECONNREFUSED') {
@@ -484,8 +539,8 @@ async function getBlastMessages(blastId, userId) {
  */
 async function getLogs(userId, filters) {
   const { page = 1, limit = 50, blast_id, status, search, from, to } = filters;
-  const offset = (Math.max(page, 1) - 1) * Math.min(Math.max(limit, 1), 200);
-  const maxLimit = Math.min(Math.max(limit, 1), 200);
+  const maxLimit = Math.min(Math.max(limit, 1), 5000);
+  const offset = (Math.max(page, 1) - 1) * maxLimit;
 
   const conditions = ['b.user_id = $1'];
   const params = [userId];
@@ -571,6 +626,8 @@ async function getLogs(userId, filters) {
  * Create a new blast retrying only failed messages from a previous blast.
  */
 async function retryFailed(originalBlastId, userId) {
+  assertConnected(userId);
+
   // 1. Get original blast
   const { rows: blastRows } = await pool.query(
     'SELECT * FROM blasts WHERE id = $1 AND user_id = $2',

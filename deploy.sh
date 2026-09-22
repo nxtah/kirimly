@@ -25,8 +25,9 @@ fi
 # ── Input konfigurasi ──
 echo ""
 echo -e "${YELLOW}Masukkan konfigurasi database:${NC}"
-read -p "DB Password (default: Kirimly2345): " DB_PASS
-DB_PASS="${DB_PASS:-Kirimly2345}"
+GEN_DB_PASS="$(openssl rand -hex 12)"
+read -p "DB Password (default: random): " DB_PASS
+DB_PASS="${DB_PASS:-$GEN_DB_PASS}"
 
 read -p "DB User (default: kirimly_user): " DB_USER
 DB_USER="${DB_USER:-kirimly_user}"
@@ -39,14 +40,16 @@ echo -e "${YELLOW}Masukkan konfigurasi admin:${NC}"
 read -p "Admin Username (default: admin): " ADMIN_USER
 ADMIN_USER="${ADMIN_USER:-admin}"
 
-read -sp "Admin Password (default: Kirimly2345): " ADMIN_PASS
-ADMIN_PASS="${ADMIN_PASS:-Kirimly2345}"
+GEN_ADMIN_PASS="$(openssl rand -hex 8)"
+read -sp "Admin Password (default: random): " ADMIN_PASS
+ADMIN_PASS="${ADMIN_PASS:-$GEN_ADMIN_PASS}"
 echo ""
 
 echo ""
 echo -e "${YELLOW}IP / Domain untuk frontend:${NC}"
-read -p "IP / Domain VPS (default: 202.155.13.210): " VPS_IP
-VPS_IP="${VPS_IP:-202.155.13.210}"
+DETECTED_IP="$(curl -s -m 5 ifconfig.me || hostname -I | awk '{print $1}')"
+read -p "IP / Domain VPS (default: ${DETECTED_IP}): " VPS_IP
+VPS_IP="${VPS_IP:-$DETECTED_IP}"
 
 read -p "Port frontend (default: 3000): " FE_PORT
 FE_PORT="${FE_PORT:-3000}"
@@ -107,31 +110,25 @@ BLAST_WAVE_DELAY_MIN_MS=900000
 BLAST_WAVE_DELAY_MAX_MS=1200000
 BLAST_MAX_WAVES=3
 BLAST_MAX_PER_WAVE=20
+CORS_ORIGIN=http://${VPS_IP}:${FE_PORT}
+TRUST_PROXY=true
+ADMIN_USERNAME=${ADMIN_USER}
+ADMIN_PASSWORD=${ADMIN_PASS}
 EOF
-
-# Fix dotenv path
-cd src
-sed -i "s|require('dotenv').config();|const path = require('path');\nrequire('dotenv').config({ path: path.resolve(__dirname, '../.env') });|" app.js 2>/dev/null
-cd ..
+chmod 600 .env
 
 npm install --silent 2>/dev/null
 
-# Import schema
-echo "Import schema..."
-PGPASSWORD="${DB_PASS}" psql -U ${DB_USER} -d ${DB_NAME} -h localhost -f ../database/schema.sql 2>/dev/null || {
-  echo -e "${YELLOW}Schema import gagal — mungkin sudah ada. Lanjut...${NC}"
-}
-
-# Seed admin
-echo "Seed admin..."
-node src/seed/create-admin.js --username="${ADMIN_USER}" --password="${ADMIN_PASS}" 2>/dev/null || true
+# Schema + migrations + admin (idempotent, safe to re-run)
+echo "Setup database..."
+node scripts/setup-db.js
 
 # ── 6. Setup frontend ──
 echo -e "${GREEN}[6/9] Setup frontend...${NC}"
 cd ../frontend
 
 cat > .env.local << EOF
-NEXT_PUBLIC_API_URL=http://${VPS_IP}:3001
+NEXT_PUBLIC_API_URL=http://${VPS_IP}:${FE_PORT}
 EOF
 
 npm install --silent 2>/dev/null
@@ -144,9 +141,6 @@ npm install -g pm2 --silent
 # ── 8. Start PM2 ──
 echo -e "${GREEN}[8/9] Start dengan PM2...${NC}"
 cd ../backend
-
-# Fix duplicate require di index.js kalo ada
-sed -i '/^const { processScheduledBlasts }/d' src/index.js 2>/dev/null
 
 pm2 delete kirimly-backend 2>/dev/null || true
 pm2 delete kirimly-frontend 2>/dev/null || true
@@ -201,7 +195,7 @@ echo -e "${GREEN}========================================${NC}"
 echo ""
 echo -e "  Frontend:  http://${VPS_IP}:${FE_PORT}"
 echo -e "  Admin:     http://${VPS_IP}:${FE_PORT}/admin/login"
-echo -e "  Backend:   http://${VPS_IP}:3001"
+echo -e "  Backend:   http://${VPS_IP}:${FE_PORT}/api/health (via Nginx)"
 echo ""
 echo -e "  Admin login:"
 echo -e "    Username: ${ADMIN_USER}"

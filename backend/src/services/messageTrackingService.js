@@ -13,6 +13,7 @@
  *   - Accuracy improves with shorter windows but misses slow replies.
  */
 
+const { isLidUser } = require('@whiskeysockets/baileys');
 const pool = require('../config/database');
 
 // Batch-flush buffer: accumulate updates per userId and flush periodically
@@ -66,18 +67,54 @@ async function flushQueue(userId) {
     const ids = items.map((i) => i.waMsgId);
     const ts = items[0].timestamp; // all in same batch ≈ same time
 
+    // A read receipt implies delivery, so backfill delivered_at when it is missing.
+    const backfillDelivered = col === 'read_at' ? 'delivered_at = COALESCE(delivered_at, $2),' : '';
+
     await pool.query(
       `UPDATE blast_messages
        SET status = CASE
          WHEN status IN ('sent', 'delivered') THEN $1
          ELSE status
        END,
+       ${backfillDelivered}
        ${col} = COALESCE(${col}, $2)
        WHERE wa_message_id = ANY($3::text[])
          AND wa_message_id IS NOT NULL`,
       [col.replace('_at', ''), ts, ids]
     );
   }
+
+  const { rows: touched } = await pool.query(
+    `SELECT DISTINCT blast_id FROM blast_messages WHERE wa_message_id = ANY($1::text[])`,
+    [batch.map((i) => i.waMsgId)]
+  );
+  await recountAggregates(userId, touched.map((r) => r.blast_id));
+}
+
+/**
+ * Recompute blasts.delivered_count/read_count from blast_messages for the given
+ * blast ids (cumulative: a read message is also delivered). Shared by the
+ * delivery/read flush above and by handlePotentialReply below, so both paths
+ * that can set delivered_at/read_at keep the aggregate counters consistent.
+ */
+async function recountAggregates(userId, blastIds) {
+  if (blastIds.length === 0) return;
+  await pool.query(
+    `UPDATE blasts b
+     SET delivered_count = s.delivered,
+         read_count      = s.read,
+         updated_at      = NOW()
+     FROM (
+       SELECT blast_id,
+              COUNT(*) FILTER (WHERE delivered_at IS NOT NULL)::int AS delivered,
+              COUNT(*) FILTER (WHERE read_at IS NOT NULL)::int      AS read
+       FROM blast_messages
+       WHERE blast_id = ANY($1::int[])
+       GROUP BY blast_id
+     ) s
+     WHERE b.id = s.blast_id AND b.user_id = $2`,
+    [blastIds, userId]
+  );
 }
 
 // Periodic flush for all non-empty queues (snapshot keys to avoid live-iterator races)
@@ -115,6 +152,51 @@ function attachMessagesUpdate(socket, userId) {
 }
 
 /**
+ * Turn a message's JID into a plain phone number, even when WhatsApp addresses
+ * the chat by "LID" (a privacy-preserving identifier some chats now use)
+ * instead of a phone-number JID (`<phone>@s.whatsapp.net`). Without this,
+ * replies from a LID-addressed chat would be silently ignored (a real gap,
+ * not just "no reply yet") — WhatsApp does not always tell us up-front which
+ * addressing mode a given chat is using.
+ *
+ * Resolution order:
+ *   1. remoteJid is already a phone-number JID — use it directly (fast path,
+ *      covers the vast majority of contacts).
+ *   2. Baileys already resolved the LID for us on the message itself
+ *      (`key.remoteJidAlt` / `key.participantAlt`) — no lookup needed.
+ *   3. Otherwise, ask Baileys' own LID↔phone-number mapping store
+ *      (`socket.signalRepository.lidMapping`, populated as WhatsApp reveals
+ *      mappings over time) — may still be unknown for a brand-new LID chat,
+ *      in which case we give up quietly rather than guess.
+ */
+async function resolvePhoneNumber(socket, msg) {
+  const remoteJid = msg.key?.remoteJid;
+  if (!remoteJid) return null;
+
+  const stripDevice = (jid) => jid.split('@')[0].split(':')[0];
+
+  if (remoteJid.includes('@s.whatsapp.net')) {
+    return stripDevice(remoteJid);
+  }
+
+  const alt = msg.key?.remoteJidAlt || msg.key?.participantAlt;
+  if (alt && alt.includes('@s.whatsapp.net')) {
+    return stripDevice(alt);
+  }
+
+  if (isLidUser(remoteJid) && socket?.signalRepository?.lidMapping) {
+    try {
+      const pn = await socket.signalRepository.lidMapping.getPNForLID(remoteJid);
+      if (pn) return stripDevice(pn);
+    } catch {
+      // No mapping known yet for this LID — nothing more we can do for this message.
+    }
+  }
+
+  return null;
+}
+
+/**
  * Attach messages.upsert handler — detect replies from contacts.
  * Baileys emits { messages: [proto.WebMessageInfo], type: 'notify' }
  *
@@ -129,22 +211,19 @@ function attachMessagesUpsert(socket, userId) {
       for (const msg of messages) {
         // Only incoming messages from other people
         if (msg.key?.fromMe) continue;
-
-        const remoteJid = msg.key?.remoteJid;
-        if (!remoteJid || !remoteJid.includes('@s.whatsapp.net')) continue;
-
-        // Extract phone number (remove @s.whatsapp.net suffix)
-        const phoneNumber = remoteJid.split('@')[0];
+        if (!msg.key?.remoteJid) continue;
 
         const replyBody =
           msg.message?.conversation ||
           msg.message?.extendedTextMessage?.text ||
           null;
 
-        // Find matching blast_message (recent, sent to this number)
         // Run async but don't block the event loop
-        handlePotentialReply(userId, phoneNumber, replyBody).catch((err) => {
-          console.error(`Reply detection error user=${userId} phone=${phoneNumber}:`, err);
+        resolvePhoneNumber(socket, msg).then((phoneNumber) => {
+          if (!phoneNumber) return;
+          return handlePotentialReply(userId, phoneNumber, replyBody);
+        }).catch((err) => {
+          console.error(`Reply detection error user=${userId}:`, err);
         });
       }
     } catch (err) {
@@ -160,7 +239,7 @@ async function handlePotentialReply(userId, phoneNumber, replyBody) {
   // Find latest blast_message to this phone that hasn't been replied yet
   // Only consider blasts from the last 24 hours
   const { rows } = await pool.query(
-    `SELECT bm.id, bm.status, b.blast_id
+    `SELECT bm.id, bm.status, bm.blast_id
      FROM blast_messages bm
      JOIN blasts b ON b.id = bm.blast_id
      WHERE bm.phone_number = $1
@@ -178,20 +257,29 @@ async function handlePotentialReply(userId, phoneNumber, replyBody) {
 
   const bm = rows[0];
 
-  // Upgrade status to replied (only forward — never downgrade)
+  // A reply proves the contact received AND read the message, regardless of
+  // whether WhatsApp ever sent us delivery/read receipts for it (the recipient
+  // may have "Read Receipts" turned off in their own privacy settings — that
+  // only suppresses the blue-tick *signal* back to us, it doesn't mean they
+  // didn't read it). So backfill delivered_at/read_at here too (only forward,
+  // never overwriting an earlier real timestamp) — nested: replied ⟹ read ⟹ delivered.
   await pool.query(
     `UPDATE blast_messages
-     SET status = 'replied', replied_at = NOW(), reply_body = COALESCE($1, reply_body)
+     SET status = 'replied', replied_at = NOW(), reply_body = COALESCE($1, reply_body),
+         delivered_at = COALESCE(delivered_at, NOW()),
+         read_at = COALESCE(read_at, NOW())
      WHERE id = $2 AND replied_at IS NULL`,
     [replyBody, bm.id]
   );
 
-  // Update aggregate counter on blast
+  // Update aggregate counters on blast (replied_count is a simple increment;
+  // delivered/read may have just been backfilled above, so recount those too).
   await pool.query(
     `UPDATE blasts SET replied_count = replied_count + 1, updated_at = NOW()
      WHERE id = $1 AND user_id = $2`,
     [rows[0].blast_id, userId]
   );
+  await recountAggregates(userId, [rows[0].blast_id]);
 }
 
 /* ─────────────────── public API ─────────────────── */

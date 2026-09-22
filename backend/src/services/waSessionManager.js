@@ -6,8 +6,12 @@
  * to /sessions/{userId}/, and syncs status to wa_sessions table.
  */
 
-const { makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
-const { Boom } = require('@hapi/boom');
+const {
+  makeWASocket,
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  DisconnectReason,
+} = require('@whiskeysockets/baileys');
 const QRCode = require('qrcode');
 const path = require('path');
 const fs = require('fs');
@@ -18,6 +22,28 @@ const SESSIONS_DIR = path.resolve(__dirname, '../../sessions');
 
 // ── In-memory registry: userId → { socket, status, qrRaw, qrDataUri } ──
 const sessions = new Map();
+
+// userId → consecutive failed reconnects (reset once a QR or a connection succeeds)
+const reconnectAttempts = new Map();
+const reconnectTimers = new Map(); // userId → pending reconnect timeout
+const MAX_RECONNECTS = 5;
+
+// WhatsApp rejects clients that announce an outdated Web version (Baileys' bundled one goes stale),
+// so fetch the current one and cache it.
+let cachedVersion = null;
+let cachedVersionAt = 0;
+async function getWaVersion() {
+  if (cachedVersion && Date.now() - cachedVersionAt < 60 * 60 * 1000) return cachedVersion;
+  try {
+    const { version } = await fetchLatestBaileysVersion();
+    cachedVersion = version;
+    cachedVersionAt = Date.now();
+    return version;
+  } catch (err) {
+    console.warn('Could not fetch latest WhatsApp Web version, using Baileys default:', err.message);
+    return cachedVersion || undefined;
+  }
+}
 
 /* ─────────────────────── helpers ─────────────────────── */
 
@@ -71,6 +97,10 @@ async function getDbSession(userId) {
  * Returns { qrRaw, qrDataUri } if still pending, or null if already connected.
  */
 async function startSession(userId) {
+  // A manual (re)start supersedes any pending automatic reconnect
+  clearTimeout(reconnectTimers.get(userId));
+  reconnectTimers.delete(userId);
+
   // Kill existing socket if any
   const existing = sessions.get(userId);
   if (existing?.socket) {
@@ -91,7 +121,10 @@ async function startSession(userId) {
 
   const { state, saveCreds } = await useMultiFileAuthState(dir);
 
+  const version = await getWaVersion();
+
   const socket = makeWASocket({
+    ...(version ? { version } : {}),
     auth: state,
     printQRInTerminal: false,
     syncFullHistory: false,
@@ -117,6 +150,7 @@ async function startSession(userId) {
 
     // ── QR received ──
     if (qr) {
+      reconnectAttempts.delete(userId);
       entry.qrRaw = qr;
       entry.status = 'pending';
       try {
@@ -139,6 +173,7 @@ async function startSession(userId) {
 
     // ── Connected ──
     if (connection === 'open') {
+      reconnectAttempts.delete(userId);
       entry.status = 'connected';
       const phone = socket.user?.id
         ? socket.user.id.split(':')[0]
@@ -182,11 +217,25 @@ async function startSession(userId) {
         return;
       }
 
-      // Reconnect unless explicitly terminated
+      // Reconnect unless explicitly terminated — with backoff, and give up after MAX_RECONNECTS
       if (!isExpired && reason !== DisconnectReason.loggedOut) {
-        await upsertSession(userId, { status: 'pending', error_message: 'Reconnecting…' });
-        // Small delay to avoid reconnect storms
-        setTimeout(() => startSession(userId), 2000);
+        const attempt = (reconnectAttempts.get(userId) || 0) + 1;
+        reconnectAttempts.set(userId, attempt);
+        console.warn(`Session ${userId} closed (code ${reason}), reconnect attempt ${attempt}/${MAX_RECONNECTS}`);
+
+        if (attempt > MAX_RECONNECTS) {
+          reconnectAttempts.delete(userId);
+          await upsertSession(userId, {
+            status: 'disconnected',
+            error_message: `Connection failed (code ${reason}). Please reconnect.`,
+          });
+        } else {
+          await upsertSession(userId, { status: 'pending', error_message: 'Reconnecting…' });
+          reconnectTimers.set(userId, setTimeout(() => {
+            reconnectTimers.delete(userId);
+            startSession(userId).catch((e) => console.error(`Session ${userId} reconnect error:`, e));
+          }, Math.min(2000 * 2 ** (attempt - 1), 30000)));
+        }
       }
       // Resolve qrWait on close so it doesn't hang (caller checks status)
       qrResolve('close');
@@ -286,6 +335,10 @@ async function getSessionInfo(userId) {
  * Used by admin panel and user self-logout.
  */
 async function terminateSession(userId, reason = 'user_initiated') {
+  clearTimeout(reconnectTimers.get(userId));
+  reconnectTimers.delete(userId);
+  reconnectAttempts.delete(userId);
+
   const mem = sessions.get(userId);
   if (mem?.socket) {
     mem.socket.ev.removeAllListeners();

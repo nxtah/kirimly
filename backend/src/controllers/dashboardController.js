@@ -13,7 +13,7 @@ async function stats(req, res) {
       pool.query(
         `SELECT
            COUNT(*)::int                          AS total_blasts,
-           COALESCE(SUM(total_contacts), 0)::int  AS total_sent,
+           COALESCE(SUM(sent_count), 0)::int      AS total_sent,
            COALESCE(SUM(failed_count), 0)::int    AS total_failed,
            COALESCE(SUM(delivered_count), 0)::int AS total_delivered,
            COALESCE(SUM(read_count), 0)::int      AS total_read,

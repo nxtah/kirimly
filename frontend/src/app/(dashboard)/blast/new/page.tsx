@@ -1,13 +1,14 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
+import { Suspense, useEffect, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import { api } from "@/lib/api";
 import DashboardLayout from "@/components/DashboardLayout";
 import Modal from "@/components/Modal";
 import PageHeader from "@/components/ui/PageHeader";
 import { SkeletonTable } from "@/components/ui/Skeleton";
-import { Plus, Send, Search, AlertTriangle, FileText, Users, Clock, Waves, Trash2, Gauge } from "lucide-react";
+import { Plus, Send, Search, AlertTriangle, FileText, Users, Clock, Waves, Trash2, Gauge, Sparkles } from "lucide-react";
+import type { CmabRecommendation } from "@/lib/cmab";
 
 interface Template { id: number; name: string; body: string; variables: string[]; }
 interface Contact { id: number; name: string; phone_number: string; }
@@ -27,8 +28,25 @@ const WAVE_DELAY_OPTIONS = [
   { value: 900000, label: "15 menit" },
 ];
 
+// useSearchParams harus berada di dalam <Suspense> agar `next build` lolos.
 export default function NewBlastPage() {
+  return (
+    <Suspense fallback={null}>
+      <NewBlastForm />
+    </Suspense>
+  );
+}
+
+// Info bila halaman dibuka dari hasil segmentasi: /blast/new?run=<id>&cluster=<no>
+interface SegmentInfo { clusterNo: number; eligible: number; selected: number }
+
+function NewBlastForm() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const [segmentInfo, setSegmentInfo] = useState<SegmentInfo | null>(null);
+  const [cmabDecisionId, setCmabDecisionId] = useState<number | null>(null);
+  const [cmabRecommendedId, setCmabRecommendedId] = useState<number | null>(null);
+  const [cmabScore, setCmabScore] = useState<number | null>(null);
   const [templates, setTemplates] = useState<Template[]>([]);
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [loading, setLoading] = useState(true);
@@ -57,7 +75,57 @@ export default function NewBlastPage() {
           api.get<{ contacts: Contact[]; pagination: any }>("/api/contacts", { params: { limit: 500 } }),
         ]);
         setTemplates(tRes.templates);
-        setContacts(cRes.contacts);
+        let allContacts = cRes.contacts;
+
+        // Target dari cluster segmentasi: isi wave otomatis (batas anti-banned tetap MAX_WAVES × MAX_PER_WAVE)
+        const runId = searchParams.get("run");
+        const clusterNo = searchParams.get("cluster");
+        if (runId && clusterNo) {
+          try {
+            const seg = await api.get<{
+              eligible: number;
+              members: { contact_id: number; name: string; phone_number: string }[];
+            }>(`/api/segmentation/runs/${runId}/segments/${clusterNo}/members`, {
+              params: { limit: MAX_WAVES * MAX_PER_WAVE },
+            });
+
+            const known = new Set(allContacts.map((c) => c.id));
+            allContacts = [
+              ...seg.members.filter((m) => !known.has(m.contact_id))
+                .map((m) => ({ id: m.contact_id, name: m.name, phone_number: m.phone_number })),
+              ...allContacts,
+            ];
+
+            const ids = seg.members.map((m) => m.contact_id);
+            const chunked: number[][] = [];
+            for (let i = 0; i < ids.length; i += MAX_PER_WAVE) chunked.push(ids.slice(i, i + MAX_PER_WAVE));
+            if (chunked.length > 0) {
+              setWaves(chunked);
+              setCurrentWaveIdx(0);
+              setBlastName(`Cluster ${clusterNo}`);
+            }
+            setSegmentInfo({ clusterNo: Number(clusterNo), eligible: seg.eligible, selected: ids.length });
+          } catch (err: any) {
+            setError(err?.body?.error || "Gagal memuat anggota cluster");
+          }
+        }
+
+        setContacts(allContacts);
+
+        // Rekomendasi CMAB: opsional & non-fatal — kalau gagal, form tetap berfungsi seperti biasa.
+        // runId/clusterNo dari query param (kalau ada) diteruskan sebagai audience context.
+        try {
+          const rec = await api.post<CmabRecommendation>("/api/cmab/recommend", {
+            ...(runId && clusterNo ? { run_id: Number(runId), cluster_no: Number(clusterNo) } : {}),
+          });
+          setCmabDecisionId(rec.decision_id);
+          setCmabRecommendedId(rec.recommended_template_id);
+          const scoreRow = rec.scores.find((s) => s.template_id === rec.recommended_template_id);
+          setCmabScore(scoreRow?.ucb_score ?? null);
+          setSelectedTemplateId((prev) => (prev === "" ? rec.recommended_template_id : prev));
+        } catch {
+          // rekomendasi opsional — abaikan
+        }
       } catch (err: any) {
         setError(err?.body?.error || "Failed to load data");
       } finally {
@@ -123,6 +191,7 @@ export default function NewBlastPage() {
       if (mode === "schedule" && scheduledDate && scheduledTime) {
         body.scheduled_at = new Date(`${scheduledDate}T${scheduledTime}`).toISOString();
       }
+      if (cmabDecisionId) body.cmab_decision_id = cmabDecisionId;
       const res = await api.post<{ blast_id: number }>("/api/blasts", body);
       setConfirmOpen(false);
       router.push(`/blast/${res.blast_id}`);
@@ -159,6 +228,20 @@ export default function NewBlastPage() {
           </div>
         )}
 
+        {segmentInfo && (
+          <div className="bg-primary-50 border border-primary-200 text-primary-800 text-sm rounded-2xl px-5 py-3 mb-6">
+            <p className="font-medium">
+              Target dari Cluster {segmentInfo.clusterNo}: {segmentInfo.selected} dari {segmentInfo.eligible} anggota dipilih.
+            </p>
+            {segmentInfo.eligible > segmentInfo.selected && (
+              <p className="text-xs mt-1 text-primary-700">
+                Batas anti-banned {MAX_PER_WAVE} kontak × {MAX_WAVES} wave per broadcast. Sisanya bisa dikirim di broadcast berikutnya
+                (yang belum pernah dikirimi didahulukan). Anda tetap bisa mengubah pilihan di bawah.
+              </p>
+            )}
+          </div>
+        )}
+
         {/* Broadcast Name */}
         <section className="bg-surface-card rounded-2xl shadow-card p-6 mb-5">
           <div className="flex items-center gap-2 mb-4">
@@ -175,6 +258,11 @@ export default function NewBlastPage() {
           <div className="flex items-center gap-2 mb-4">
             <span className="flex items-center justify-center w-7 h-7 rounded-lg bg-primary-100 text-primary-700 text-xs font-bold">2</span>
             <h2 className="text-sm font-semibold text-ink">Choose Template</h2>
+            {cmabRecommendedId != null && (
+              <a href="/cmab" className="ml-auto text-xs text-primary-600 hover:text-primary-700 hover:underline">
+                Lihat performa CMAB →
+              </a>
+            )}
           </div>
           {templates.length === 0 ? (
             <p className="text-sm text-ink-muted">No templates yet. Create one first.</p>
@@ -191,7 +279,14 @@ export default function NewBlastPage() {
                     <FileText size={15} />
                   </div>
                   <div className="min-w-0">
-                    <p className="text-sm font-medium text-ink">{t.name}</p>
+                    <div className="flex items-center gap-1.5">
+                      <p className="text-sm font-medium text-ink truncate">{t.name}</p>
+                      {cmabRecommendedId === t.id && (
+                        <span className="flex items-center gap-1 text-[10px] font-semibold text-primary-700 bg-primary-100 px-1.5 py-0.5 rounded-full shrink-0">
+                          <Sparkles size={10} /> CMAB{cmabScore != null ? ` · ${cmabScore.toFixed(2)}` : ""}
+                        </span>
+                      )}
+                    </div>
                     <p className="text-xs text-ink-muted line-clamp-2 mt-0.5">{t.body}</p>
                   </div>
                 </label>

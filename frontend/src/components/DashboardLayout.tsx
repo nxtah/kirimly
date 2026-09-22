@@ -9,6 +9,8 @@ import {
   MessageSquareText,
   Send,
   ClipboardList,
+  Network,
+  Brain,
   LogOut,
   ChevronDown,
   PanelLeftClose,
@@ -19,7 +21,9 @@ const NAV_ITEMS = [
   { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
   { href: "/contacts", label: "Contacts", icon: Users },
   { href: "/templates", label: "Templates", icon: MessageSquareText },
+  { href: "/segmentation", label: "Segments", icon: Network },
   { href: "/blast", label: "Blasts", icon: Send },
+  { href: "/cmab", label: "CMAB", icon: Brain },
   { href: "/logs", label: "Logs", icon: ClipboardList },
 ];
 
@@ -141,8 +145,8 @@ export default function DashboardLayout({
 
       {/* ── Mobile floating bottom nav ── */}
       <nav className="fixed bottom-3 inset-x-3 z-40 lg:hidden">
-        <div className="bg-white/80 backdrop-blur-xl border border-white/30 shadow-lg shadow-black/5 rounded-2xl px-2 py-1.5">
-          <div className="flex items-center justify-around">
+        <div className="bg-white/80 backdrop-blur-xl border border-white/30 shadow-lg shadow-black/5 rounded-2xl px-1.5 py-1.5 overflow-x-auto">
+          <div className="flex items-center justify-around gap-0.5 min-w-max">
             {NAV_ITEMS.map((item) => {
               const Icon = item.icon;
               const isActive = pathname === item.href;
@@ -150,7 +154,7 @@ export default function DashboardLayout({
                 <a
                   key={item.href}
                   href={item.href}
-                  className={`flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-xl text-[10px] font-medium transition-all duration-200 ${
+                  className={`flex flex-col items-center gap-0.5 px-2 py-1.5 rounded-xl text-[10px] font-medium transition-all duration-200 shrink-0 ${
                     isActive
                       ? "text-primary-600 bg-primary-50 shadow-sm"
                       : "text-ink-light hover:text-ink-muted"

@@ -44,11 +44,7 @@ GRANT ALL ON SCHEMA public TO kirimly_user;
 \q
 ```
 
-```bash
-# Import schema
-cd /opt/kirimly/database
-PGPASSWORD='password_kuat_disini' psql -U kirimly_user -d kirimly -h localhost -f schema.sql
-```
+Schema, migrasi (termasuk `migration-003-segmentation.sql` untuk fitur segmentasi), dan akun admin dibuat otomatis oleh `npm run db:setup` (langkah 4). Untuk server yang sudah berjalan, cukup jalankan `npm run db:setup` lagi setelah `git pull` — migrasi bersifat idempotent.
 
 ## 4. Setup Backend
 
@@ -75,12 +71,16 @@ BLAST_WAVE_DELAY_MIN_MS=900000
 BLAST_WAVE_DELAY_MAX_MS=1200000
 BLAST_MAX_WAVES=3
 BLAST_MAX_PER_WAVE=20
+CORS_ORIGIN=https://domain-anda.com
+TRUST_PROXY=true
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=password_admin_kuat
 ```
 
 ```bash
 npm install
-# Seed admin user
-node src/seed/create-admin.js --username=admin --password=password_admin_kuat
+# Buat schema + migrasi + akun admin (aman dijalankan ulang)
+npm run db:setup
 ```
 
 ## 5. Setup Frontend
@@ -92,7 +92,8 @@ nano .env.local
 
 **.env.local:**
 ```
-NEXT_PUBLIC_API_URL=http://localhost:3001
+# Lewat Nginx (langkah 7), API ada di origin yang sama dengan frontend
+NEXT_PUBLIC_API_URL=https://domain-anda.com
 ```
 
 ```bash

@@ -1,7 +1,17 @@
 node_modules/
 .env
+.env.local
 *.log
 .DS_Store
 
+# Next.js build output & caches
+.next/
+*.tsbuildinfo
+
 # Baileys session data (per-user credentials, jangan masuk git)
 backend/sessions/
+
+# Embedded dev Postgres data (npm run dev:embedded)
+backend/.pgdata/
+
+backend/.db-ready

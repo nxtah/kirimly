@@ -1,9 +1,10 @@
 const blastService = require('../services/blastService');
+const cmabService = require('../cmab/service');
 
 // ── POST /api/blasts ──
 async function create(req, res) {
   const userId = req.user.user_id;
-  const { template_id, waves, scheduled_at, name, delay_per_contact_ms, delay_per_wave_ms } = req.body;
+  const { template_id, waves, scheduled_at, name, delay_per_contact_ms, delay_per_wave_ms, cmab_decision_id } = req.body;
 
   if (!template_id) {
     return res.status(400).json({ error: 'template_id is required' });
@@ -14,6 +15,16 @@ async function create(req, res) {
 
   try {
     const blast = await blastService.startBlast(userId, template_id, waves, scheduled_at || null, name || null, delay_per_contact_ms || null, delay_per_wave_ms || null);
+
+    // CMAB: catat template yang BENAR-BENAR dipakai (bisa beda dari yang direkomendasikan).
+    // Non-fatal — kegagalan di sini tidak boleh menggagalkan blast yang sudah dibuat.
+    if (cmab_decision_id) {
+      try {
+        await cmabService.linkDecision(userId, cmab_decision_id, blast.id, template_id);
+      } catch (err) {
+        console.error('CMAB linkDecision error (non-fatal):', err);
+      }
+    }
 
     res.status(201).json({
       message: blast.scheduled_at ? 'Blast scheduled' : 'Blast started',

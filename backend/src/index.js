@@ -1,6 +1,7 @@
 const app = require('./app');
 const { restoreAllSessions } = require('./services/waSessionManager');
 const { markOrphanedBlasts, processScheduledBlasts } = require('./services/blastService');
+const { processDueRewards } = require('./cmab/service');
 
 const PORT = process.env.PORT || 3001;
 
@@ -32,6 +33,13 @@ app.listen(PORT, () => {
   setInterval(() => {
     processScheduledBlasts().catch((err) => {
       console.error('Scheduled blast processor error:', err);
+    });
+  }, 30000).unref();
+
+  // Poll for CMAB decisions whose blast completed a while ago and needs its reward computed
+  setInterval(() => {
+    processDueRewards().catch((err) => {
+      console.error('CMAB reward processor error:', err);
     });
   }, 30000).unref();
 });

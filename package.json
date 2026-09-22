@@ -3,10 +3,17 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "npx concurrently -n BE,FE -c yellow,cyan \"cd backend && npm run dev\" \"cd frontend && npm run dev\"",
+    "setup": "npm install && cd backend && npm install && cd ../frontend && npm install && cd .. && node scripts/setup-env.js",
+    "dev": "concurrently -n BE,FE -c yellow,cyan \"cd backend && npm run wait-db && npm run dev\" \"cd frontend && npm run dev\"",
+    "dev:embedded": "node scripts/clear-marker.js && concurrently -n DB,BE,FE -c magenta,yellow,cyan \"cd backend && npm run dev:db\" \"cd backend && npm run wait-db:embedded && npm run dev\" \"cd frontend && npm run dev\"",
     "dev:backend": "cd backend && npm run dev",
     "dev:frontend": "cd frontend && npm run dev",
+    "db:setup": "cd backend && npm run db:setup",
+    "test": "cd backend && npm test",
     "build": "cd frontend && npm run build",
-    "start": "cd frontend && npm run start"
+    "start": "concurrently -n BE,FE -c yellow,cyan \"cd backend && npm start\" \"cd frontend && npm start\""
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
   }
 }

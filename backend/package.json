@@ -5,7 +5,14 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "dev": "node src/index.js",
+    "dev:watch": "node --watch-path=./src src/index.js",
+    "db:setup": "node scripts/setup-db.js",
+    "dev:db": "node scripts/dev-db.js",
+    "wait-db": "node scripts/wait-for-db.js",
+    "wait-db:embedded": "node scripts/wait-for-db.js --marker",
+    "seed:admin": "node src/seed/create-admin.js",
+    "test": "node --test --test-concurrency=1 \"test/*.test.js\""
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^7.0.0-rc13",
@@ -16,5 +23,8 @@
     "jsonwebtoken": "^9.0.2",
     "pg": "^8.13.1",
     "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "embedded-postgres": "^18.4.0-beta.17"
   }
 }

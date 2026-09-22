@@ -5,7 +5,7 @@ const { normalizePhone } = require('../utils/phone');
 async function list(req, res) {
   const userId = req.user.user_id;
   const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 500);
   const offset = (page - 1) * limit;
   const search = req.query.search ? `%${req.query.search}%` : null;
 
