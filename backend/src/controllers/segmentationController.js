@@ -23,11 +23,20 @@ async function importProspects(req, res) {
     return res.status(400).json({ error: `Maksimal ${MAX_IMPORT_ROWS} baris per request` });
   }
 
+  // dry_run=true → hanya hitung ringkasan preprocessing (pratinjau), tidak menulis apa pun
+  const dryRun = req.query.dry_run === 'true';
+  const importId = req.body.import_id != null ? parseInt(req.body.import_id, 10) : null;
+  const meta = req.body.meta && typeof req.body.meta === 'object' ? req.body.meta : {};
+
   try {
-    const result = await service.importProspects(req.user.user_id, rows);
+    const result = await service.importProspects(req.user.user_id, rows, {
+      dryRun,
+      importId: Number.isInteger(importId) ? importId : null,
+      meta,
+    });
     const { imported, updated, invalid, duplicates } = result.summary;
-    res.status(201).json({
-      message: `Import selesai: ${imported} baru, ${updated} diperbarui, ${duplicates} duplikat dilewati, ${invalid} tidak valid`,
+    res.status(dryRun ? 200 : 201).json({
+      message: `${dryRun ? 'Pratinjau' : 'Import selesai'}: ${imported} baru, ${updated} diperbarui, ${duplicates} duplikat dilewati, ${invalid} tidak valid`,
       ...result,
     });
   } catch (err) {
@@ -146,6 +155,26 @@ async function deleteRun(req, res) {
   }
 }
 
+// ── GET /api/segmentation/runs/:id/details?cluster=&page=&limit= ──
+async function runDetails(req, res) {
+  const id = parseId(req.params.id);
+  if (!id) return res.status(400).json({ error: 'Invalid run ID' });
+  const cluster = req.query.cluster != null && req.query.cluster !== '' ? parseId(req.query.cluster) : null;
+  if (req.query.cluster != null && req.query.cluster !== '' && !cluster) {
+    return res.status(400).json({ error: 'Invalid cluster number' });
+  }
+
+  try {
+    const result = await service.getRunDetails(req.user.user_id, id, {
+      cluster, page: req.query.page, limit: req.query.limit,
+    });
+    if (!result) return res.status(404).json({ error: 'Run not found' });
+    res.json(result);
+  } catch (err) {
+    handleError(res, err, 'Run details');
+  }
+}
+
 // ── GET /api/segmentation/runs/:id/segments/:no/members ──
 async function segmentMembers(req, res) {
   const id = parseId(req.params.id);
@@ -163,5 +192,5 @@ async function segmentMembers(req, res) {
 
 module.exports = {
   importProspects, listProspects, prospectSummary, deleteProspect, resetProspects,
-  suggestK, createRun, listRuns, getRun, deleteRun, segmentMembers,
+  suggestK, createRun, listRuns, getRun, deleteRun, segmentMembers, runDetails,
 };

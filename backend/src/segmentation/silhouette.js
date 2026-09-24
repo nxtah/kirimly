@@ -4,6 +4,7 @@
  */
 
 const { kmeans, mulberry32, sqDist, countDistinct } = require('./kmeans');
+const { daviesBouldin, recommendK } = require('./metrics');
 
 const MAX_SAMPLE = 1500;
 
@@ -57,10 +58,16 @@ function silhouetteScore(X, labels, k, { seed = 42, maxSample = MAX_SAMPLE } = {
 }
 
 /**
- * Coba K = 2..maxK, hitung silhouette tiap K, rekomendasikan yang tertinggi.
- * @returns {{scores: {k:number, silhouette:number, inertia:number}[], recommended: number|null}}
+ * Evaluasi kandidat K = minK..maxK: Inertia (SSE), Silhouette, Davies-Bouldin untuk tiap K,
+ * lalu rekomendasi K dari TIGA metrik (Elbow + Silhouette + Davies-Bouldin), bukan satu.
+ *
+ * Memakai konfigurasi K-Means yang SAMA dengan eksekusi akhir (seed & jumlah restart default),
+ * sehingga SSE pada tabel evaluasi identik dengan SSE hasil clustering untuk K yang sama.
+ *
+ * @returns {{scores: {k:number, inertia:number, silhouette:number|null, davies_bouldin:number|null}[],
+ *            recommendation: object|null, recommended: number|null}}
  */
-function suggestK(X, { minK = 2, maxK = 8, seed = 42 } = {}) {
+function suggestK(X, { minK = 2, maxK = 6, seed = 42 } = {}) {
   const n = X.length;
   const distinct = countDistinct(X);
   const upper = Math.min(maxK, n - 1, distinct);
@@ -68,20 +75,20 @@ function suggestK(X, { minK = 2, maxK = 8, seed = 42 } = {}) {
   const scores = [];
   for (let k = minK; k <= upper; k++) {
     try {
-      const res = kmeans(X, k, { seed, nInit: 4 });
-      const sil = silhouetteScore(X, res.labels, k, { seed });
-      if (sil !== null) scores.push({ k, silhouette: sil, inertia: res.inertia });
+      const res = kmeans(X, k, { seed });
+      scores.push({
+        k,
+        inertia: res.inertia,
+        silhouette: silhouetteScore(X, res.labels, k, { seed }),
+        davies_bouldin: daviesBouldin(X, res.labels, res.centroids),
+      });
     } catch {
       // K ini tidak feasible untuk data — lewati
     }
   }
 
-  let recommended = null;
-  let bestSil = -Infinity;
-  for (const s of scores) {
-    if (s.silhouette > bestSil + 1e-9) { bestSil = s.silhouette; recommended = s.k; }
-  }
-  return { scores, recommended };
+  const recommendation = recommendK(scores);
+  return { scores, recommendation, recommended: recommendation ? recommendation.k : null };
 }
 
 module.exports = { silhouetteScore, suggestK };

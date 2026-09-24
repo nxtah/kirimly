@@ -17,6 +17,7 @@ router.get('/suggest-k',          authMiddleware, controller.suggestK);
 router.post('/runs',              authMiddleware, controller.createRun);
 router.get('/runs',               authMiddleware, controller.listRuns);
 router.get('/runs/:id/segments/:no/members', authMiddleware, controller.segmentMembers);
+router.get('/runs/:id/details',   authMiddleware, controller.runDetails);
 router.get('/runs/:id',           authMiddleware, controller.getRun);
 router.delete('/runs/:id',        authMiddleware, controller.deleteRun);
 

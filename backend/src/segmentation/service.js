@@ -4,15 +4,23 @@
  */
 
 const pool = require('../config/database');
-const { ATTRS, validateRows } = require('./validate');
+const { ATTRS, validateRows, isComplete } = require('./validate');
+const { UNKNOWN } = require('./normalize');
 const { oneHotEncode } = require('./oneHot');
 const { kmeans } = require('./kmeans');
 const { silhouetteScore, suggestK: computeSuggestK } = require('./silhouette');
+const { daviesBouldin } = require('./metrics');
 const { buildProfile } = require('./profile');
+const { buildNormalizationReport, mergeReports, similarValues } = require('./report');
 
 const MIN_K = 2;
 const MAX_K = 10;
+const EVAL_MAX_K = 6; // rentang evaluasi default: K = 2..6
 const SEED = 42;
+const MAX_SIMILAR_DISTINCT = 1500; // batas jumlah kategori unik untuk deteksi nilai mirip (O(n²))
+
+// Kondisi SQL "keempat variabel clustering terisi" (ATTRS dari konstanta, bukan input user)
+const COMPLETE_SQL = ATTRS.map((a) => `${a} <> '${UNKNOWN}'`).join(' AND ');
 
 function httpError(statusCode, message) {
   const err = new Error(message);
@@ -22,17 +30,77 @@ function httpError(statusCode, message) {
 
 /* ───────────────────────── import ───────────────────────── */
 
+/** Catat / gabungkan hasil satu batch ke satu baris riwayat import (bukti preprocessing TA). */
+async function recordImport(client, userId, importId, meta, batch) {
+  let row;
+  if (importId) {
+    const { rows } = await client.query(
+      'SELECT * FROM segmentation_imports WHERE id = $1 AND user_id = $2 FOR UPDATE',
+      [importId, userId]
+    );
+    row = rows[0];
+    if (!row) throw httpError(404, 'Import tidak ditemukan');
+  } else {
+    const { rows } = await client.query(
+      `INSERT INTO segmentation_imports (user_id, source_name, sheets, missing, normalization)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [
+        userId,
+        typeof meta.source_name === 'string' ? meta.source_name.slice(0, 255) : null,
+        JSON.stringify(Array.isArray(meta.sheets) ? meta.sheets.slice(0, 50) : []),
+        JSON.stringify(Object.fromEntries(ATTRS.map((a) => [a, 0]))),
+        JSON.stringify({}),
+      ]
+    );
+    row = rows[0];
+  }
+
+  const missing = { ...(row.missing || {}) };
+  for (const a of ATTRS) missing[a] = (missing[a] || 0) + (batch.missing[a] || 0);
+  const normalization = mergeReports(row.normalization || {}, batch.normalization);
+
+  await client.query(
+    `UPDATE segmentation_imports
+     SET total_rows = total_rows + $2, valid_rows = valid_rows + $3, invalid_rows = invalid_rows + $4,
+         duplicate_rows = duplicate_rows + $5, missing = $6, normalization = $7
+     WHERE id = $1`,
+    [row.id, batch.total, batch.valid, batch.invalid, batch.duplicates, JSON.stringify(missing), JSON.stringify(normalization)]
+  );
+  return row.id;
+}
+
 /**
  * Validasi + bersihkan baris, upsert ke prospects, dan sinkronkan ke contacts
  * (nama kontak yang sudah ada tidak ditimpa).
+ *
+ * @param {object} opts
+ *   dryRun   true = hanya hitung ringkasan preprocessing, TIDAK menulis apa pun
+ *   importId lanjutkan riwayat import yang sama (import dikirim per batch 500 baris)
+ *   meta     { source_name, sheets, extra_duplicates } — extra_duplicates = duplikat yang sudah
+ *            dibuang client (mis. nomor sama antar-sheet) agar total & duplikat tetap akurat
  */
-async function importProspects(userId, rows) {
-  const { valid, invalid, duplicates, missing } = validateRows(rows);
+async function importProspects(userId, rows, opts = {}) {
+  const { dryRun = false, importId = null, meta = {} } = opts;
+  const { valid, invalid, duplicates, missing, events, phoneFixed } = validateRows(rows);
+  const extraDup = Math.max(parseInt(meta.extra_duplicates, 10) || 0, 0);
+  const normalization = buildNormalizationReport(events);
+  const excluded = valid.filter((r) => !isComplete(r)).length;
 
   let imported = 0;
   let updated = 0;
+  let resultImportId = importId;
 
-  if (valid.length > 0) {
+  if (dryRun) {
+    // Berapa baris yang sudah ada (akan diperbarui) vs baru — tanpa menulis apa pun
+    if (valid.length > 0) {
+      const { rows: existing } = await pool.query(
+        'SELECT COUNT(*)::int AS n FROM prospects WHERE user_id = $1 AND phone_number = ANY($2::text[])',
+        [userId, valid.map((r) => r.phone_number)]
+      );
+      updated = existing[0].n;
+      imported = valid.length - updated;
+    }
+  } else {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -73,6 +141,15 @@ async function importProspects(userId, rows) {
         else updated++;
       }
 
+      resultImportId = await recordImport(client, userId, importId, meta, {
+        total: rows.length + extraDup,
+        valid: valid.length,
+        invalid: invalid.length,
+        duplicates: duplicates.length + extraDup,
+        missing,
+        normalization,
+      });
+
       await client.query('COMMIT');
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {});
@@ -83,14 +160,20 @@ async function importProspects(userId, rows) {
   }
 
   return {
+    import_id: resultImportId,
+    dry_run: dryRun,
     summary: {
-      total: rows.length,
+      total: rows.length + extraDup,
+      valid: valid.length,
       imported,
       updated,
       invalid: invalid.length,
-      duplicates: duplicates.length,
+      duplicates: duplicates.length + extraDup,
       missing_attributes: missing,
+      excluded_from_clustering: excluded,
+      phone_fixed: phoneFixed,
     },
+    normalization,
     errors: invalid.slice(0, 100),
   };
 }
@@ -126,23 +209,76 @@ async function listProspects(userId, { page = 1, limit = 20, search = null } = {
   };
 }
 
+/**
+ * Ringkasan data + preprocessing untuk menu Segmentasi (Data Summary & Preprocessing Summary).
+ * Field lama (total, created_contacts, distribution) dipertahankan.
+ */
 async function prospectSummary(userId) {
-  const [{ rows: totalRows }, { rows: createdRows }, ...dists] = await Promise.all([
+  const [{ rows: totalRows }, { rows: createdRows }, { rows: completeRows }, { rows: importRows }, ...dists] = await Promise.all([
     pool.query('SELECT COUNT(*)::int AS n FROM prospects WHERE user_id = $1', [userId]),
     pool.query('SELECT COUNT(*)::int AS n FROM segmentation_contacts WHERE user_id = $1', [userId]),
+    pool.query(`SELECT COUNT(*)::int AS n FROM prospects WHERE user_id = $1 AND ${COMPLETE_SQL}`, [userId]),
+    pool.query(
+      `SELECT id, source_name, sheets, total_rows, valid_rows, invalid_rows, duplicate_rows, missing, normalization, created_at
+       FROM segmentation_imports WHERE user_id = $1 ORDER BY id`,
+      [userId]
+    ),
     ...ATTRS.map((attr) =>
       // attr berasal dari konstanta ATTRS, bukan input user
       pool.query(
         `SELECT ${attr} AS value, COUNT(*)::int AS count FROM prospects
-         WHERE user_id = $1 GROUP BY ${attr} ORDER BY count DESC, value ASC LIMIT 8`,
+         WHERE user_id = $1 GROUP BY ${attr} ORDER BY count DESC, value ASC`,
         [userId]
       )
     ),
   ]);
 
   const distribution = {};
-  ATTRS.forEach((attr, i) => { distribution[attr] = dists[i].rows; });
-  return { total: totalRows[0].n, created_contacts: createdRows[0].n, distribution };
+  const similar = {};
+  ATTRS.forEach((attr, i) => {
+    const all = dists[i].rows.filter((r) => r.value !== UNKNOWN);
+    distribution[attr] = dists[i].rows.slice(0, 8);
+    similar[attr] = all.length <= MAX_SIMILAR_DISTINCT
+      ? similarValues(new Map(all.map((r) => [r.value, r.count])))
+      : [];
+  });
+
+  // Jumlah fitur One-Hot dihitung dari dataset clustering yang sebenarnya
+  const dataset = await loadDataset(userId);
+  const { columns } = dataset.length > 0 ? oneHotEncode(dataset, ATTRS) : { columns: [] };
+  const featuresByAttr = Object.fromEntries(ATTRS.map((a) => [a, columns.filter((c) => c.attr === a).length]));
+
+  // Gabungan seluruh riwayat import
+  let normalization = {};
+  const missing = Object.fromEntries(ATTRS.map((a) => [a, 0]));
+  const agg = { count: importRows.length, total_rows: 0, valid_rows: 0, invalid_rows: 0, duplicate_rows: 0, missing, sources: [], last_at: null };
+  for (const r of importRows) {
+    agg.total_rows += r.total_rows;
+    agg.valid_rows += r.valid_rows;
+    agg.invalid_rows += r.invalid_rows;
+    agg.duplicate_rows += r.duplicate_rows;
+    for (const a of ATTRS) missing[a] += (r.missing || {})[a] || 0;
+    normalization = mergeReports(normalization, r.normalization || {});
+    agg.sources.push({ id: r.id, name: r.source_name, sheets: r.sheets || [], rows: r.total_rows, created_at: r.created_at });
+    agg.last_at = r.created_at;
+  }
+
+  const total = totalRows[0].n;
+  const complete = completeRows[0].n;
+  return {
+    total,
+    created_contacts: createdRows[0].n,
+    distribution,
+    clustering: {
+      complete,
+      excluded: total - complete,
+      feature_count: columns.length,
+      features_by_attr: featuresByAttr,
+    },
+    imports: agg,
+    normalization,
+    similar_values: similar,
+  };
 }
 
 async function deleteProspect(userId, id) {
@@ -174,6 +310,8 @@ async function resetProspects(userId, { deleteContacts = false } = {}) {
 
     const runs = (await client.query('DELETE FROM cluster_runs WHERE user_id = $1', [userId])).rowCount;
     const prospects = (await client.query('DELETE FROM prospects WHERE user_id = $1', [userId])).rowCount;
+    // Riwayat preprocessing ikut direset: angka "total awal/valid/invalid" hanya berarti untuk dataset yang sama
+    await client.query('DELETE FROM segmentation_imports WHERE user_id = $1', [userId]);
 
     await client.query('COMMIT');
     return { prospects, runs, contacts };
@@ -187,23 +325,59 @@ async function resetProspects(userId, { deleteContacts = false } = {}) {
 
 /* ───────────────────────── clustering ───────────────────────── */
 
+/**
+ * Dataset untuk clustering: hanya baris yang keempat variabelnya terisi.
+ * Baris dengan variabel kosong tetap tersimpan (sebagai kontak), tetapi tidak ikut One-Hot/K-Means
+ * karena kategori palsu "Tidak Diketahui" akan menghasilkan cluster artefak.
+ */
 async function loadDataset(userId) {
   const { rows } = await pool.query(
-    `SELECT id, ${ATTRS.join(', ')} FROM prospects WHERE user_id = $1 ORDER BY id`,
+    `SELECT id, name, phone_number, ${ATTRS.join(', ')} FROM prospects
+     WHERE user_id = $1 AND ${COMPLETE_SQL} ORDER BY id`,
     [userId]
   );
   return rows;
 }
 
-async function suggestK(userId, maxK = 8) {
+/**
+ * Evaluasi kandidat K (default 2..6): SSE, Silhouette, Davies-Bouldin + rekomendasi dari 3 metrik.
+ */
+async function suggestK(userId, maxK = EVAL_MAX_K) {
   const rows = await loadDataset(userId);
-  if (rows.length < 3) throw httpError(400, 'Minimal 3 data calon mahasiswa untuk menyarankan K');
+  if (rows.length < 3) throw httpError(400, 'Minimal 3 data calon mahasiswa (dengan keempat variabel terisi) untuk mengevaluasi K');
 
-  const max = Math.min(Math.max(parseInt(maxK, 10) || 8, MIN_K), MAX_K);
-  const { matrix } = oneHotEncode(rows, ATTRS);
-  const { scores, recommended } = computeSuggestK(matrix, { minK: MIN_K, maxK: max, seed: SEED });
+  const max = Math.min(Math.max(parseInt(maxK, 10) || EVAL_MAX_K, MIN_K), MAX_K);
+  const { matrix, columns } = oneHotEncode(rows, ATTRS);
+  const { scores, recommendation, recommended } = computeSuggestK(matrix, { minK: MIN_K, maxK: max, seed: SEED });
 
-  return { n_samples: rows.length, scores, recommended };
+  return { n_samples: rows.length, feature_count: columns.length, scores, recommendation, recommended };
+}
+
+/** Ringkasan preprocessing yang disimpan bersama tiap hasil clustering (bukti untuk dokumentasi). */
+async function preprocessingSnapshot(userId, nSamples, featureCount) {
+  const [{ rows: totalRows }, { rows: importRows }] = await Promise.all([
+    pool.query('SELECT COUNT(*)::int AS n FROM prospects WHERE user_id = $1', [userId]),
+    pool.query(
+      'SELECT total_rows, valid_rows, invalid_rows, duplicate_rows, missing FROM segmentation_imports WHERE user_id = $1',
+      [userId]
+    ),
+  ]);
+
+  const missing = Object.fromEntries(ATTRS.map((a) => [a, 0]));
+  const sums = { total_rows: 0, valid_rows: 0, invalid_rows: 0, duplicate_rows: 0 };
+  for (const r of importRows) {
+    for (const key of Object.keys(sums)) sums[key] += r[key];
+    for (const a of ATTRS) missing[a] += (r.missing || {})[a] || 0;
+  }
+
+  return {
+    total_prospects: totalRows[0].n,
+    used_for_clustering: nSamples,
+    excluded_missing: totalRows[0].n - nSamples,
+    feature_count: featureCount,
+    variables: ATTRS,
+    imports: { count: importRows.length, ...sums, missing },
+  };
 }
 
 async function runClustering(userId, { k, name = null }) {
@@ -219,6 +393,12 @@ async function runClustering(userId, { k, name = null }) {
   const { matrix, columns } = oneHotEncode(rows, ATTRS);
   const result = kmeans(matrix, k, { seed: SEED });
   const silhouette = silhouetteScore(matrix, result.labels, k, { seed: SEED });
+  const dbi = daviesBouldin(matrix, result.labels, result.centroids);
+
+  // Evaluasi K ikut disimpan bersama hasil, supaya tiap run berdiri sendiri sebagai bukti (SSE pada
+  // tabel = SSE run untuk K yang sama karena seed & konfigurasi K-Means identik).
+  const evaluation = computeSuggestK(matrix, { minK: MIN_K, maxK: Math.min(Math.max(EVAL_MAX_K, k), MAX_K), seed: SEED });
+  const preprocessing = await preprocessingSnapshot(userId, rows.length, columns.length);
 
   // Kelompokkan anggota; nomor cluster diurutkan dari yang terbesar (1 = terbanyak)
   const groups = Array.from({ length: k }, () => []);
@@ -230,8 +410,9 @@ async function runClustering(userId, { k, name = null }) {
     await client.query('BEGIN');
 
     const { rows: runRows } = await client.query(
-      `INSERT INTO cluster_runs (user_id, name, k, n_samples, inertia, silhouette, iterations, seed, params)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      `INSERT INTO cluster_runs
+         (user_id, name, k, n_samples, inertia, silhouette, davies_bouldin, iterations, seed, params, evaluation, preprocessing)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        RETURNING id`,
       [
         userId,
@@ -240,9 +421,12 @@ async function runClustering(userId, { k, name = null }) {
         rows.length,
         result.inertia,
         silhouette,
+        dbi,
         result.iterations,
         result.seed,
         JSON.stringify({ attributes: ATTRS, feature_count: columns.length, features: columns }),
+        JSON.stringify({ scores: evaluation.scores, recommendation: evaluation.recommendation }),
+        JSON.stringify(preprocessing),
       ]
     );
     const runId = runRows[0].id;
@@ -278,7 +462,7 @@ async function runClustering(userId, { k, name = null }) {
 
 async function listRuns(userId) {
   const { rows } = await pool.query(
-    `SELECT id, name, k, n_samples, silhouette, inertia, created_at
+    `SELECT id, name, k, n_samples, silhouette, davies_bouldin, inertia, created_at
      FROM cluster_runs WHERE user_id = $1 ORDER BY created_at DESC, id DESC LIMIT 50`,
     [userId]
   );
@@ -287,7 +471,8 @@ async function listRuns(userId) {
 
 async function getRun(userId, runId) {
   const { rows } = await pool.query(
-    `SELECT id, name, k, n_samples, silhouette, inertia, iterations, seed, created_at
+    `SELECT id, name, k, n_samples, silhouette, davies_bouldin, inertia, iterations, seed,
+            evaluation, preprocessing, params, created_at
      FROM cluster_runs WHERE id = $1 AND user_id = $2`,
     [runId, userId]
   );
@@ -344,7 +529,51 @@ async function getSegmentMembers(userId, runId, clusterNo, limit = 60) {
   };
 }
 
+/**
+ * Detail anggota untuk keperluan analisis/dokumentasi (BUKAN untuk kirim blast — itu memakai
+ * getSegmentMembers): nama, nomor, keempat variabel, dan label cluster. Tidak difilter is_blocked.
+ * @param {object} opts { cluster?: number, page, limit }
+ */
+async function getRunDetails(userId, runId, { cluster = null, page = 1, limit = 50 } = {}) {
+  const { rows: run } = await pool.query('SELECT id, k FROM cluster_runs WHERE id = $1 AND user_id = $2', [runId, userId]);
+  if (run.length === 0) return null;
+
+  const p = Math.max(parseInt(page, 10) || 1, 1);
+  const l = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 5000);
+  const params = [runId];
+  let where = 's.run_id = $1';
+  if (cluster != null) {
+    params.push(cluster);
+    where += ` AND s.cluster_no = $${params.length}`;
+  }
+
+  const base = `FROM cluster_members m
+                JOIN cluster_segments s ON s.id = m.segment_id
+                JOIN prospects pr ON pr.id = m.prospect_id
+                WHERE ${where}`;
+
+  const [data, total] = await Promise.all([
+    pool.query(
+      `SELECT s.cluster_no, pr.id AS prospect_id, pr.name, pr.phone_number,
+              pr.program_studi, pr.asal_sekolah, pr.jurusan_sekolah, pr.domisili
+       ${base}
+       ORDER BY s.cluster_no ASC, pr.name ASC, pr.id ASC
+       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, l, (p - 1) * l]
+    ),
+    pool.query(`SELECT COUNT(*)::int AS n ${base}`, params),
+  ]);
+
+  const n = total.rows[0].n;
+  return {
+    run_id: runId,
+    members: data.rows,
+    pagination: { page: p, limit: l, total: n, total_pages: Math.ceil(n / l) },
+  };
+}
+
 module.exports = {
+  getRunDetails,
   importProspects,
   listProspects,
   prospectSummary,

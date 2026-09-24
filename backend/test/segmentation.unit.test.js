@@ -82,7 +82,8 @@ test('normalize: domisili — ambil kota, rapikan prefix Kota/Kabupaten', () => 
   assert.equal(n.normalizeDomisili('Kota Bandung, Jawa Barat'), 'Kota Bandung');
   assert.equal(n.normalizeDomisili('kab. bandung'), 'Kabupaten Bandung');
   assert.equal(n.normalizeDomisili('KABUPATEN Sleman'), 'Kabupaten Sleman');
-  assert.equal(n.normalizeDomisili('kota adm. jakarta selatan'), 'Kota Jakarta Selatan');
+  // Kota tanpa kabupaten kembar dibakukan tanpa awalan "Kota" (Jakarta Selatan = Kota Jakarta Selatan)
+  assert.equal(n.normalizeDomisili('kota adm. jakarta selatan'), 'Jakarta Selatan');
   assert.equal(n.normalizeDomisili('bandung'), 'Bandung');
 });
 
