@@ -97,17 +97,24 @@ async function getDbSession(userId) {
  * Start (or restart) a Baileys socket for a given user.
  * Returns { qrRaw, qrDataUri } if still pending, or null if already connected.
  */
-async function startSession(userId) {
+// userId → in-flight start. Two sockets on the SAME credentials kick each other off WhatsApp
+// (stream conflict, code 440), so concurrent starts (boot-time restore + the connect page,
+// a reconnect timer + a manual start, ...) must share ONE start instead of racing.
+const startsInFlight = new Map();
+
+function startSession(userId) {
+  const running = startsInFlight.get(userId);
+  if (running) return running;
+
+  const p = doStartSession(userId).finally(() => startsInFlight.delete(userId));
+  startsInFlight.set(userId, p);
+  return p;
+}
+
+async function doStartSession(userId) {
   // A manual (re)start supersedes any pending automatic reconnect
   clearTimeout(reconnectTimers.get(userId));
   reconnectTimers.delete(userId);
-
-  // Kill existing socket if any
-  const existing = sessions.get(userId);
-  if (existing?.socket) {
-    existing.socket.end(undefined);
-    existing.socket.ev.removeAllListeners();
-  }
 
   await upsertSession(userId, {
     status: 'pending',
@@ -123,6 +130,15 @@ async function startSession(userId) {
   const { state, saveCreds } = await useMultiFileAuthState(dir);
 
   const version = await getWaVersion();
+
+  // Kill any existing socket right before creating the new one (after the awaits above, so a
+  // socket registered while we were waiting can't be orphaned and keep fighting the new one).
+  const existing = sessions.get(userId);
+  if (existing?.socket) {
+    existing.socket.ev.removeAllListeners();
+    existing.socket.end(undefined);
+    sessions.delete(userId);
+  }
 
   const socket = makeWASocket({
     ...(version ? { version } : {}),
@@ -147,6 +163,14 @@ async function startSession(userId) {
   // ── Connection update handler ──
   socket.ev.on('connection.update', async (update) => {
     try {
+      // A stale socket (already replaced by a newer one) must not touch shared state: without
+      // this, its late 'close' deleted the NEW socket's entry (server thought "not connected"
+      // while the phone showed connected) and scheduled yet another reconnect.
+      if (sessions.get(userId) !== entry) {
+        socket.ev.removeAllListeners();
+        return;
+      }
+
       const { connection, lastDisconnect, qr } = update;
 
     // ── QR received ──
