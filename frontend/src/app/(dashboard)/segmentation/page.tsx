@@ -257,7 +257,7 @@ export default function SegmentationPage() {
                 result={suggest}
                 loading={suggesting}
                 disabled={complete < 3}
-                disabledHint={complete < 3 ? "Butuh minimal 3 data dengan keempat variabel terisi. Import data terlebih dahulu." : undefined}
+                disabledHint={complete < 3 ? "Butuh minimal 3 data calon mahasiswa. Import data terlebih dahulu." : undefined}
                 selectedK={k}
                 onEvaluate={handleEvaluate}
                 onPickK={setK}
@@ -286,11 +286,11 @@ export default function SegmentationPage() {
                   </button>
                 </div>
                 {complete < 2 ? (
-                  <p className="flex items-center gap-1.5 text-xs text-ink-muted mt-3"><Info size={13} /> Import data calon mahasiswa (dengan keempat variabel terisi) dulu.</p>
+                  <p className="flex items-center gap-1.5 text-xs text-ink-muted mt-3"><Info size={13} /> Import data calon mahasiswa dulu.</p>
                 ) : (
                   <p className="text-xs text-ink-muted mt-3">
                     {complete} data diproses dengan {summary.clustering.feature_count} fitur One-Hot
-                    {summary.clustering.excluded > 0 && <> · {summary.clustering.excluded} baris missing value dikeluarkan</>}.
+                    {summary.clustering.imputed > 0 && <> · {summary.clustering.imputed} baris missing value diimputasi</>}.
                     Hasil disimpan ke database dan dapat dipilih sebagai target campaign.
                   </p>
                 )}

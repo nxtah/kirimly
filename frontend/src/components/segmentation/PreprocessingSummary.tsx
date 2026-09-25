@@ -45,9 +45,9 @@ export default function PreprocessingSummary({ summary }: { summary: ProspectSum
             </span>
           ))}
         </div>
-        {summary.clustering.excluded > 0 && (
+        {summary.clustering.imputed > 0 && (
           <p className="text-[11px] text-ink-light mt-2">
-            {summary.clustering.excluded} baris memiliki variabel kosong: tetap tersimpan sebagai kontak, tetapi dikeluarkan dari One-Hot Encoding &amp; K-Means.
+            {summary.clustering.imputed} baris memiliki variabel kosong: nilainya diisi &quot;Tidak Diketahui&quot; (imputasi) dan tetap ikut One-Hot Encoding &amp; K-Means.
           </p>
         )}
       </div>

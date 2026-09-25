@@ -35,7 +35,7 @@ export default function ClusterResult({ run }: { run: RunDetail }) {
 
       <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-4">
         <StatCard title="K Digunakan" value={run.k} highlighted />
-        <StatCard title="Data Diproses" value={run.n_samples} subtitle={pre ? `${pre.excluded_missing} baris missing dikeluarkan` : undefined} />
+        <StatCard title="Data Diproses" value={run.n_samples} subtitle={pre ? `${pre.imputed_missing ?? 0} baris missing diimputasi` : undefined} />
         <StatCard title="Jumlah Cluster" value={run.segments.length} />
         <StatCard title="Inertia / SSE" value={run.inertia != null ? run.inertia.toFixed(2) : "—"} subtitle="lebih kecil lebih rapat" />
         <StatCard title="Silhouette" value={run.silhouette != null ? run.silhouette.toFixed(3) : "—"} subtitle="mendekati 1 = terpisah jelas" />
@@ -94,7 +94,7 @@ export default function ClusterResult({ run }: { run: RunDetail }) {
           </div>
           {pre && (
             <p className="text-[11px] text-ink-light mt-3">
-              {pre.feature_count} fitur One-Hot dari 4 variabel · {pre.total_prospects} data tersimpan · {pre.excluded_missing} dikeluarkan karena missing value.
+              {pre.feature_count} fitur One-Hot dari 4 variabel · {pre.total_prospects} data tersimpan · {pre.imputed_missing ?? 0} baris missing diimputasi &quot;Tidak Diketahui&quot;.
             </p>
           )}
         </div>

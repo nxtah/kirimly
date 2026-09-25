@@ -6,8 +6,8 @@
  *          asal_sekolah, jurusan_sekolah, domisili }
  * Aturan : nama + nomor WA wajib dan valid (ditolak bila tidak).
  *          Nomor duplikat dalam satu input → baris pertama dipakai.
- *          Variabel clustering kosong → "Tidak Diketahui" (dihitung sebagai missing value,
- *          baris tetap disimpan tetapi dikeluarkan dari clustering).
+ *          Variabel clustering kosong → diimputasi "Tidak Diketahui" (tetap dihitung sebagai
+ *          missing value di laporan; baris tetap ikut clustering).
  *          Setiap perubahan nilai dicatat di `events` supaya bisa dilaporkan (tidak diam-diam).
  */
 

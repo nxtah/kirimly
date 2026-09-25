@@ -1,6 +1,6 @@
 /**
  * Integrasi alur penelitian segmentasi terhadap Postgres asli (DB test terpisah):
- * dry-run preprocessing, import per-batch + riwayat, missing dikeluarkan dari clustering,
+ * dry-run preprocessing, import per-batch + riwayat, missing diimputasi & tetap ikut clustering,
  * evaluasi K (SSE/Silhouette/DBI), metrik tersimpan, detail anggota, reset.
  *
  * Run: npm test
@@ -75,7 +75,7 @@ function makeDataset() {
   // nomor Excel tanpa nol depan (2 baris)
   rows[10].phone_number = phone(0, 10).slice(1);
   rows[11].phone_number = phone(0, 11).slice(1);
-  // missing value: program studi kosong (3 baris) → tersimpan tapi tidak ikut clustering
+  // missing value: program studi kosong (3 baris) → diimputasi 'Tidak Diketahui', tetap ikut clustering
   rows[12].program_studi = '';
   rows[13].program_studi = '   ';
   rows[14].program_studi = null;
@@ -124,7 +124,8 @@ test('dry_run: ringkasan preprocessing lengkap, TIDAK menulis apa pun ke databas
   assert.equal(s.valid, 60);
   assert.equal(s.phone_fixed, 2, 'dua nomor tanpa nol depan diperbaiki');
   assert.equal(s.missing_attributes.program_studi, 3);
-  assert.equal(s.excluded_from_clustering, 3);
+  assert.equal(s.excluded_from_clustering, 0, 'tidak ada baris yang dikeluarkan');
+  assert.equal(s.imputed_rows, 3);
   assert.equal(s.imported, 60, 'belum ada di DB → semua akan menjadi data baru');
   assert.deepEqual(r.data.errors.map((e) => e.code).sort(), ['empty', 'phone', 'scientific']);
 
@@ -177,16 +178,17 @@ test('summary: data awal/valid/invalid/duplikat, missing, laporan normalisasi, n
   assert.equal(r.status, 200);
   const d = r.data;
 
-  assert.equal(d.total, 60, '60 baris valid tersimpan (3 di antaranya tidak lengkap)');
+  assert.equal(d.total, 60, '60 baris valid tersimpan (3 di antaranya diimputasi)');
   assert.equal(d.imports.count, 1);
   assert.deepEqual(
     [d.imports.total_rows, d.imports.valid_rows, d.imports.invalid_rows, d.imports.duplicate_rows],
     [66, 60, 3, 3]
   );
 
-  // missing value tersimpan tapi dikeluarkan dari clustering
-  assert.equal(d.clustering.complete, 57);
-  assert.equal(d.clustering.excluded, 3);
+  // missing value diimputasi dan tetap dipakai clustering: seluruh data valid ikut
+  assert.equal(d.clustering.complete, 60);
+  assert.equal(d.clustering.excluded, 0);
+  assert.equal(d.clustering.imputed, 3);
   complete = d.clustering.complete;
 
   // jumlah fitur One-Hot dihitung dari dataset clustering, hanya 4 variabel
@@ -219,7 +221,7 @@ test('suggest-k: tabel K 2..6 (SSE, Silhouette, DBI) dari data aktual + rekomend
   assert.equal(r.status, 200, JSON.stringify(r.data));
   const d = r.data;
 
-  assert.equal(d.n_samples, complete, 'hanya baris lengkap yang dievaluasi');
+  assert.equal(d.n_samples, complete, 'seluruh data valid dievaluasi');
   assert.ok(d.feature_count > 0);
   assert.deepEqual(d.scores.map((s) => s.k), [2, 3, 4, 5, 6]);
   for (const s of d.scores) {
@@ -242,7 +244,7 @@ test('suggest-k: tabel K 2..6 (SSE, Silhouette, DBI) dari data aktual + rekomend
 
 /* ───────────────────────── clustering ───────────────────────── */
 
-test('run K=3: metrik lengkap tersimpan, missing tidak ikut, distribusi penuh, SSE konsisten dengan evaluasi', async () => {
+test('run K=3: metrik lengkap tersimpan, missing ikut, distribusi penuh, SSE konsisten dengan evaluasi', async () => {
   const ev = (await call('GET', '/api/segmentation/suggest-k', { token: tokenA })).data;
   const r = await call('POST', '/api/segmentation/runs', { token: tokenA, body: { k: 3, name: 'Uji Penelitian' } });
   assert.equal(r.status, 201, JSON.stringify(r.data));
@@ -250,7 +252,7 @@ test('run K=3: metrik lengkap tersimpan, missing tidak ikut, distribusi penuh, S
   runId = run.id;
 
   assert.equal(run.k, 3);
-  assert.equal(run.n_samples, complete, 'baris dengan variabel kosong tidak ikut clustering');
+  assert.equal(run.n_samples, complete, 'seluruh data valid ikut clustering');
   assert.equal(typeof run.davies_bouldin, 'number');
   assert.equal(typeof run.silhouette, 'number');
   assert.equal(run.segments.reduce((s, x) => s + x.size, 0), complete);
@@ -263,7 +265,8 @@ test('run K=3: metrik lengkap tersimpan, missing tidak ikut, distribusi penuh, S
 
   // snapshot preprocessing tersimpan bersama hasil
   assert.equal(run.preprocessing.used_for_clustering, complete);
-  assert.equal(run.preprocessing.excluded_missing, 3);
+  assert.equal(run.preprocessing.excluded_missing, 0);
+  assert.equal(run.preprocessing.imputed_missing, 3);
   assert.equal(run.preprocessing.imports.total_rows, 66);
   assert.equal(run.preprocessing.feature_count, run.params.feature_count);
   assert.deepEqual(run.preprocessing.variables, ['program_studi', 'asal_sekolah', 'jurusan_sekolah', 'domisili']);
@@ -291,7 +294,7 @@ test('run K=3: metrik lengkap tersimpan, missing tidak ikut, distribusi penuh, S
 
 /* ───────────────────────── detail anggota ───────────────────────── */
 
-test('detail anggota: nama, nomor, 4 variabel, label cluster; baris missing tidak ikut; terisolasi per user', async () => {
+test('detail anggota: nama, nomor, 4 variabel, label cluster; baris missing ikut (Tidak Diketahui); terisolasi per user', async () => {
   const all = await call('GET', `/api/segmentation/runs/${runId}/details`, { token: tokenA, query: { limit: 500 } });
   assert.equal(all.status, 200, JSON.stringify(all.data));
   assert.equal(all.data.pagination.total, complete);
@@ -300,9 +303,9 @@ test('detail anggota: nama, nomor, 4 variabel, label cluster; baris missing tida
     for (const f of ['name', 'phone_number', 'program_studi', 'asal_sekolah', 'jurusan_sekolah', 'domisili', 'cluster_no']) {
       assert.ok(m[f] !== undefined && m[f] !== null && m[f] !== '', `field ${f}`);
     }
-    assert.notEqual(m.program_studi, 'Tidak Diketahui');
   }
-  assert.ok(!all.data.members.some((m) => ['Calon 0-12', 'Calon 0-13', 'Calon 0-14'].includes(m.name)), 'baris missing tidak ikut clustering');
+  const imputed = all.data.members.filter((m) => m.program_studi === 'Tidak Diketahui').map((m) => m.name).sort();
+  assert.deepEqual(imputed, ['Calon 0-12', 'Calon 0-13', 'Calon 0-14'], 'baris missing ikut clustering');
 
   // filter cluster + paginasi
   const c1 = await call('GET', `/api/segmentation/runs/${runId}/details`, { token: tokenA, query: { cluster: '1', limit: 5, page: 2 } });
@@ -322,6 +325,7 @@ test('integrasi Campaign: anggota cluster tetap bisa dipilih sebagai target (end
   const m = await call('GET', `/api/segmentation/runs/${runId}/segments/1/members`, { token: tokenA, query: { limit: 60 } });
   assert.equal(m.status, 200);
   assert.ok(m.data.eligible > 0);
+  assert.equal(m.data.pagination.total, m.data.eligible);
   assert.ok(m.data.members.every((x) => Number.isInteger(x.contact_id) && x.phone_number));
 });
 

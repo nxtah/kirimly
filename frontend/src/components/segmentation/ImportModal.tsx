@@ -135,7 +135,7 @@ export default function ImportModal({ open, onClose, onDone, existingTotal, exis
         const res = await api.post<ImportBatchResult>(IMPORT_URL, { rows: prep.rows.slice(i, i + BATCH_SIZE) }, { params: { dry_run: "true" } });
         const s = res.summary;
         total.total += s.total; total.valid += s.valid; total.invalid += s.invalid; total.duplicates += s.duplicates;
-        total.missingRows += s.excluded_from_clustering; total.phoneFixed += s.phone_fixed;
+        total.missingRows += s.imputed_rows; total.phoneFixed += s.phone_fixed;
         for (const [k, v] of Object.entries(s.missing_attributes)) total.missing[k] = (total.missing[k] || 0) + v;
         total.normalization = mergeNormReports(total.normalization, res.normalization);
         total.errors = [...total.errors, ...res.errors].slice(0, 200);
@@ -159,15 +159,29 @@ export default function ImportModal({ open, onClose, onDone, existingTotal, exis
         await api.del("/api/segmentation/prospects", { params: { delete_contacts: mode === "replace_contacts" ? "true" : undefined } });
       }
 
+      // Semua batch diproses: tiap batch dicoba ulang sekali; batch yang tetap gagal dicatat dan
+      // import DILANJUTKAN ke batch berikutnya (data yang sudah masuk tidak hilang).
       let importId: number | null = null;
+      const failed: string[] = [];
       for (let i = 0; i < prepared.rows.length; i += BATCH_SIZE) {
         const body: Record<string, unknown> = { rows: prepared.rows.slice(i, i + BATCH_SIZE) };
         if (importId) body.import_id = importId;
         else body.meta = { source_name: file.sourceName, sheets: prepared.perSheet, extra_duplicates: prepared.extraDuplicates };
-        const res: ImportBatchResult = await api.post<ImportBatchResult>(IMPORT_URL, body);
-        importId = res.import_id;
+        let lastErr = "";
+        let ok = false;
+        for (let attempt = 0; attempt < 2 && !ok; attempt++) {
+          try {
+            const res: ImportBatchResult = await api.post<ImportBatchResult>(IMPORT_URL, body);
+            importId = res.import_id;
+            ok = true;
+          } catch (err: any) {
+            lastErr = err?.body?.error || err?.message || "gagal";
+          }
+        }
+        if (!ok) failed.push(`baris ${i + 1}–${Math.min(i + BATCH_SIZE, prepared.rows.length)} (${lastErr})`);
         setProgress(Math.min(i + BATCH_SIZE, prepared.rows.length));
       }
+      if (failed.length > 0) setError(`${failed.length} batch gagal diimpor: ${failed.join("; ")}. Batch lainnya berhasil tersimpan.`);
       setStep("done");
     } catch (err: any) {
       setError(err?.body?.error || err.message || "Import gagal");
@@ -234,7 +248,7 @@ export default function ImportModal({ open, onClose, onDone, existingTotal, exis
                       {!s.usable && <p className="text-xs text-red-600 mt-1">Dilewati: {s.reason}</p>}
                       {s.usable && s.missingAttrs.length > 0 && (
                         <p className="text-xs text-amber-700 mt-1 flex items-center gap-1">
-                          <AlertTriangle size={12} /> Tanpa kolom {s.missingAttrs.map((a) => FIELD_LABELS[a]).join(", ")} — barisnya akan disimpan tetapi <strong>tidak ikut clustering</strong>.
+                          <AlertTriangle size={12} /> Tanpa kolom {s.missingAttrs.map((a) => FIELD_LABELS[a]).join(", ")} — nilainya akan diisi <strong>&quot;Tidak Diketahui&quot;</strong> dan tetap ikut clustering.
                         </p>
                       )}
                     </div>
@@ -319,7 +333,7 @@ export default function ImportModal({ open, onClose, onDone, existingTotal, exis
                 ["Data valid", agg.valid, "lolos validasi nama & nomor"],
                 ["Data invalid", agg.invalid, "ditolak (lihat alasan)"],
                 ["Data duplikat", agg.duplicates, "nomor WhatsApp sama"],
-                ["Missing value", agg.missingRows, "baris tidak ikut clustering"],
+                ["Missing value", agg.missingRows, "baris diisi Tidak Diketahui"],
                 ["Nomor diperbaiki", agg.phoneFixed, "nol depan hilang (Excel)"],
               ].map(([label, value, hint]) => (
                 <div key={label as string} className="bg-gray-50 rounded-xl p-3">
@@ -342,7 +356,7 @@ export default function ImportModal({ open, onClose, onDone, existingTotal, exis
             </div>
             {agg.missingRows > 0 && (
               <p className="text-[11px] text-ink-light mt-2">
-                Baris dengan variabel kosong tetap disimpan sebagai kontak, tetapi dikeluarkan dari One-Hot Encoding &amp; K-Means agar tidak membentuk cluster palsu &quot;Tidak Diketahui&quot;.
+                Variabel kosong diimputasi &quot;Tidak Diketahui&quot; (tetap dicatat sebagai missing value) sehingga seluruh data valid ikut One-Hot Encoding &amp; K-Means.
               </p>
             )}
           </div>
@@ -386,7 +400,7 @@ export default function ImportModal({ open, onClose, onDone, existingTotal, exis
               <p className="font-semibold">Import selesai</p>
               <p className="text-ink-muted mt-1">
                 {agg.valid} data valid disimpan · {agg.invalid} tidak valid · {agg.duplicates} duplikat dilewati
-                {agg.missingRows > 0 && ` · ${agg.missingRows} baris tidak ikut clustering (missing value)`}
+                {agg.missingRows > 0 && ` · ${agg.missingRows} baris missing value diimputasi`}
               </p>
               <p className="text-xs text-ink-muted mt-2">Ringkasan lengkap tersedia di bagian <strong>Preprocessing Summary</strong> halaman ini. Data juga ditambahkan ke daftar Contacts.</p>
             </div>

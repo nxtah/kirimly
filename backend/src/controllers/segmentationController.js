@@ -182,7 +182,9 @@ async function segmentMembers(req, res) {
   if (!id || !no) return res.status(400).json({ error: 'Invalid run or cluster number' });
 
   try {
-    const result = await service.getSegmentMembers(req.user.user_id, id, no, req.query.limit);
+    const result = await service.getSegmentMembers(req.user.user_id, id, no, {
+      page: req.query.page, limit: req.query.limit,
+    });
     if (!result) return res.status(404).json({ error: 'Cluster not found' });
     res.json(result);
   } catch (err) {

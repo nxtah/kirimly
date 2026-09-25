@@ -84,7 +84,8 @@ const PRODI = [
   ['Teknik Informatika', ['ti'], { ambiguous: true }],           // bisa juga "Teknologi Informasi"
   ['Sistem Informasi',   ['sistem informasi']],
   ['Sistem Informasi',   ['si'], { ambiguous: true }],
-  ['Ilmu Komputer',      ['ilmu komputer', 'ilkom']],
+  ['Ilmu Komputer',      ['ilmu komputer']],
+  ['Ilmu Komunikasi',    ['ilmu komunikasi', 'ilkom']],          // ILKOM → Ilmu Komunikasi (bukan Ilmu Komputer)
   ['Akuntansi',          ['akuntansi', 'akutansi']],
   ['Manajemen',          ['manajemen', 'management']],
   ['Ilmu Hukum',         ['ilmu hukum', 'hukum']],

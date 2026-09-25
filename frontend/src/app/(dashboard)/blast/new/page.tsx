@@ -13,7 +13,7 @@ import type { CmabRecommendation } from "@/lib/cmab";
 interface Template { id: number; name: string; body: string; variables: string[]; }
 interface Contact { id: number; name: string; phone_number: string; }
 
-const MAX_WAVES = 3;
+const MAX_WAVES = 100; // sama dengan default BLAST_MAX_WAVES backend
 const MAX_PER_WAVE = 20;
 
 const DELAY_OPTIONS = [
@@ -77,17 +77,27 @@ function NewBlastForm() {
         setTemplates(tRes.templates);
         let allContacts = cRes.contacts;
 
-        // Target dari cluster segmentasi: isi wave otomatis (batas anti-banned tetap MAX_WAVES × MAX_PER_WAVE)
+        // Target dari cluster segmentasi: SELURUH anggota eligible diambil (halaman demi halaman),
+        // lalu dibagi ke wave @ MAX_PER_WAVE kontak — tidak ada pemotongan.
         const runId = searchParams.get("run");
         const clusterNo = searchParams.get("cluster");
         if (runId && clusterNo) {
           try {
-            const seg = await api.get<{
-              eligible: number;
-              members: { contact_id: number; name: string; phone_number: string }[];
-            }>(`/api/segmentation/runs/${runId}/segments/${clusterNo}/members`, {
-              params: { limit: MAX_WAVES * MAX_PER_WAVE },
+            type SegMember = { contact_id: number; name: string; phone_number: string };
+            type SegPage = { eligible: number; members: SegMember[]; pagination: { total_pages: number } };
+            const first = await api.get<SegPage>(`/api/segmentation/runs/${runId}/segments/${clusterNo}/members`, {
+              params: { page: 1, limit: 500 },
             });
+            const seg = { eligible: first.eligible, members: [...first.members] };
+            for (let page = 2; page <= first.pagination.total_pages; page++) {
+              const next = await api.get<SegPage>(`/api/segmentation/runs/${runId}/segments/${clusterNo}/members`, {
+                params: { page, limit: 500 },
+              });
+              seg.members.push(...next.members);
+            }
+            if (seg.members.length !== seg.eligible) {
+              throw { body: { error: `Anggota cluster termuat ${seg.members.length} dari ${seg.eligible}; muat ulang halaman` } };
+            }
 
             const known = new Set(allContacts.map((c) => c.id));
             allContacts = [
@@ -235,8 +245,8 @@ function NewBlastForm() {
             </p>
             {segmentInfo.eligible > segmentInfo.selected && (
               <p className="text-xs mt-1 text-primary-700">
-                Batas anti-banned {MAX_PER_WAVE} kontak × {MAX_WAVES} wave per broadcast. Sisanya bisa dikirim di broadcast berikutnya
-                (yang belum pernah dikirimi didahulukan). Anda tetap bisa mengubah pilihan di bawah.
+                Anti-banned: {MAX_PER_WAVE} kontak per wave dengan jeda antar wave. Semua anggota eligible sudah dimasukkan ke wave;
+                Anda tetap bisa mengubah pilihan di bawah.
               </p>
             )}
           </div>

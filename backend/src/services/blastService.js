@@ -20,7 +20,9 @@ const DELAY_MIN = parseInt(process.env.BLAST_DELAY_MIN_MS, 10) || 5000;
 const DELAY_MAX = parseInt(process.env.BLAST_DELAY_MAX_MS, 10) || 10000;
 const WAVE_DELAY_MIN = parseInt(process.env.BLAST_WAVE_DELAY_MIN_MS, 10) || 900000; // 15min
 const WAVE_DELAY_MAX = parseInt(process.env.BLAST_WAVE_DELAY_MAX_MS, 10) || 1200000; // 20min
-const MAX_WAVES = parseInt(process.env.BLAST_MAX_WAVES, 10) || 3;
+// Anti-banned utama = jumlah per wave + jeda antar wave; jumlah wave dibuat besar agar seluruh
+// anggota sebuah cluster (ratusan kontak) bisa dijadwalkan tanpa terpotong.
+const MAX_WAVES = parseInt(process.env.BLAST_MAX_WAVES, 10) || 100;
 const MAX_PER_WAVE = parseInt(process.env.BLAST_MAX_PER_WAVE, 10) || 20;
 
 function getContactDelay(fixedMs) {

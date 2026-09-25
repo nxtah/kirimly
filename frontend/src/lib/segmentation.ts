@@ -66,6 +66,7 @@ export interface PreprocessingSnapshot {
   total_prospects: number;
   used_for_clustering: number;
   excluded_missing: number;
+  imputed_missing?: number;
   feature_count: number;
   variables: string[];
   imports: {
@@ -107,6 +108,7 @@ export interface ImportSummary {
   total: number; valid: number; imported: number; updated: number; invalid: number; duplicates: number;
   missing_attributes: Record<Attr, number>;
   excluded_from_clustering: number;
+  imputed_rows: number;
   phone_fixed: number;
 }
 export interface ImportError { index: number; name: string; phone: string; code: string; reason: string }
@@ -123,7 +125,7 @@ export interface ProspectSummary {
   total: number;
   created_contacts: number;
   distribution: Record<Attr, { value: string; count: number }[]>;
-  clustering: { complete: number; excluded: number; feature_count: number; features_by_attr: Record<Attr, number> };
+  clustering: { complete: number; excluded: number; imputed: number; feature_count: number; features_by_attr: Record<Attr, number> };
   imports: {
     count: number; total_rows: number; valid_rows: number; invalid_rows: number; duplicate_rows: number;
     missing: Record<Attr, number>; sources: ImportSource[]; last_at: string | null;

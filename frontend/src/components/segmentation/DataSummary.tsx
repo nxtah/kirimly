@@ -16,8 +16,8 @@ export default function DataSummary({ summary }: { summary: ProspectSummary }) {
         <StatCard title="Data Valid" value={hasLog ? summary.imports.valid_rows : summary.total} subtitle="lolos validasi nama & nomor" />
         <StatCard title="Data Invalid" value={hasLog ? summary.imports.invalid_rows : "—"} subtitle="ditolak saat import" />
         <StatCard title="Data Duplikat" value={hasLog ? summary.imports.duplicate_rows : "—"} subtitle="nomor WhatsApp sama" />
-        <StatCard title="Missing Value" value={c.excluded} subtitle="baris tidak ikut clustering" />
-        <StatCard title="Dipakai Clustering" value={c.complete} subtitle="keempat variabel terisi" highlighted />
+        <StatCard title="Missing Value" value={c.imputed} subtitle={`baris diisi "Tidak Diketahui"`} />
+        <StatCard title="Dipakai Clustering" value={c.complete} subtitle="seluruh data valid" highlighted />
         <StatCard title="Fitur One-Hot" value={c.feature_count} subtitle="hanya 4 variabel clustering" />
         <StatCard title="Variabel" value={ATTRS.length} subtitle="nama & nomor tidak dipakai" />
       </div>

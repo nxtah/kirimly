@@ -7,7 +7,7 @@
  *   mapped       diubah lewat kamus/aturan (singkatan → bentuk baku) — dicatat di laporan
  *   ambiguous    dipetakan lewat singkatan yang bisa bermakna ganda — dicatat & ditandai
  *   unrecognized tidak ada di kamus: TIDAK diubah selain spasi & kapitalisasi
- *   missing      kosong → "Tidak Diketahui" (dikeluarkan dari clustering)
+ *   missing      kosong → diimputasi "Tidak Diketahui" (dicatat sebagai missing value, tetap ikut clustering)
  * Sehingga tidak ada perubahan yang terjadi tanpa jejak.
  */
 
