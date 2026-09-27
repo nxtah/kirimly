@@ -1,30 +1,58 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Brain, Sparkles } from "lucide-react";
+import { Brain, Sparkles, FlaskConical, History, ChevronLeft, ChevronRight, Loader2 } from "lucide-react";
 import { api } from "@/lib/api";
 import DashboardLayout from "@/components/DashboardLayout";
 import PageHeader from "@/components/ui/PageHeader";
 import StatCard from "@/components/ui/StatCard";
 import ProgressBarList from "@/components/ui/ProgressBarList";
 import { SkeletonCard } from "@/components/ui/Skeleton";
-import { formatContext, type CmabDecision, type CmabPerformanceRow } from "@/lib/cmab";
+import RewardCurveChart from "@/components/cmab/RewardCurveChart";
+import {
+  formatContext,
+  type CmabDecision,
+  type CmabPerformanceRow,
+  type CmabSummary,
+  type Pagination,
+  type CmabRewardPoint,
+  type CmabEvaluationResult,
+} from "@/lib/cmab";
+
+const DECISIONS_PER_PAGE = 10;
+
+function pct(v: number | null) {
+  return v == null ? "—" : `${Math.round(v * 100)}%`;
+}
 
 export default function CmabPage() {
+  const [summary, setSummary] = useState<CmabSummary | null>(null);
   const [performance, setPerformance] = useState<CmabPerformanceRow[] | null>(null);
   const [decision, setDecision] = useState<CmabDecision | null>(null);
+  const [series, setSeries] = useState<CmabRewardPoint[] | null>(null);
+  const [decisions, setDecisions] = useState<CmabDecision[] | null>(null);
+  const [decisionsPagination, setDecisionsPagination] = useState<Pagination | null>(null);
+  const [decisionsPage, setDecisionsPage] = useState(1);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  const [evalResult, setEvalResult] = useState<CmabEvaluationResult | null>(null);
+  const [evalRunning, setEvalRunning] = useState(false);
+  const [evalError, setEvalError] = useState<string | null>(null);
 
   useEffect(() => {
     async function load() {
       try {
-        const [perf, latest] = await Promise.all([
+        const [s, perf, latest, rs] = await Promise.all([
+          api.get<CmabSummary>("/api/cmab/summary"),
           api.get<{ performance: CmabPerformanceRow[] }>("/api/cmab/performance"),
           api.get<{ decision: CmabDecision | null }>("/api/cmab/decisions/latest"),
+          api.get<{ series: CmabRewardPoint[] }>("/api/cmab/reward-timeseries"),
         ]);
+        setSummary(s);
         setPerformance(perf.performance);
         setDecision(latest.decision);
+        setSeries(rs.series);
       } catch (err: any) {
         setError(err?.body?.error || "Gagal memuat data CMAB");
       } finally {
@@ -34,11 +62,37 @@ export default function CmabPage() {
     load();
   }, []);
 
-  const bestReward = performance?.[0]?.avg_reward ?? null;
+  useEffect(() => {
+    async function loadDecisions() {
+      try {
+        const r = await api.get<{ decisions: CmabDecision[]; pagination: Pagination }>("/api/cmab/decisions", {
+          params: { page: decisionsPage, limit: DECISIONS_PER_PAGE },
+        });
+        setDecisions(r.decisions);
+        setDecisionsPagination(r.pagination);
+      } catch {
+        // riwayat opsional — abaikan, section lain tetap tampil
+      }
+    }
+    loadDecisions();
+  }, [decisionsPage]);
+
+  async function runSimulation() {
+    setEvalRunning(true);
+    setEvalError(null);
+    try {
+      const r = await api.post<CmabEvaluationResult>("/api/cmab/evaluate", { n_contexts: 200 });
+      setEvalResult(r);
+    } catch (err: any) {
+      setEvalError(err?.body?.error || "Simulasi gagal dijalankan");
+    } finally {
+      setEvalRunning(false);
+    }
+  }
 
   return (
     <DashboardLayout>
-      <div className="p-6 lg:p-8 max-w-5xl mx-auto">
+      <div className="p-6 lg:p-8 max-w-6xl mx-auto">
         <PageHeader
           title="CMAB"
           subtitle="Rekomendasi template WhatsApp berbasis Contextual Multi-Armed Bandit (LinUCB)"
@@ -54,19 +108,12 @@ export default function CmabPage() {
           </div>
         ) : (
           <div className="space-y-6">
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              <StatCard title="Template Dipantau" value={performance?.length ?? 0} subtitle="arm CMAB" />
-              <StatCard
-                title="Reward Terbaik"
-                value={bestReward != null ? bestReward.toFixed(2) : "—"}
-                subtitle={performance?.[0]?.template_name || "belum ada data"}
-                highlighted
-              />
-              <StatCard
-                title="Total Observasi"
-                value={performance?.reduce((s, p) => s + p.observation_count, 0) ?? 0}
-                subtitle="campaign yang sudah dipelajari"
-              />
+            {/* Ringkasan */}
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+              <StatCard title="Arm (Template)" value={summary?.arms ?? 0} subtitle="dipantau LinUCB" />
+              <StatCard title="Total Keputusan" value={summary?.decisions ?? 0} subtitle="rekomendasi diminta" />
+              <StatCard title="Observasi" value={summary?.observations ?? 0} subtitle="campaign yang sudah dipelajari" highlighted />
+              <StatCard title="Reward Pending" value={summary?.pending_rewards ?? 0} subtitle="menunggu dihitung" />
             </div>
 
             {/* Latest Decision */}
@@ -81,18 +128,23 @@ export default function CmabPage() {
                   <p className="text-ink-muted">
                     Direkomendasikan: <span className="text-ink font-medium">{decision.recommended_template_name || `Template #${decision.recommended_template_id}`}</span>
                   </p>
-                  {decision.selected_template_id && decision.selected_template_id !== decision.recommended_template_id && (
+                  {decision.manual_override && (
                     <p className="text-ink-muted">
                       Dipakai (diganti manual): <span className="text-ink font-medium">{decision.selected_template_name}</span>
                     </p>
                   )}
-                  <p className="text-ink-muted">
+                  <p className="text-ink-muted flex items-center gap-2">
                     Reward:{" "}
                     {decision.reward != null ? (
                       <span className="text-primary-700 font-semibold">{Number(decision.reward).toFixed(2)}</span>
                     ) : (
                       <span className="text-ink-light">menunggu hasil pengiriman…</span>
                     )}
+                    <span className={`text-[11px] px-2 py-0.5 rounded-full font-medium ${
+                      decision.reward_status === "computed" ? "bg-primary-100 text-primary-700" : "bg-amber-100 text-amber-700"
+                    }`}>
+                      {decision.reward_status === "computed" ? "computed" : "pending"}
+                    </span>
                   </p>
                 </div>
               ) : (
@@ -100,23 +152,178 @@ export default function CmabPage() {
               )}
             </div>
 
-            {/* Current Performance */}
+            {/* Performa per template + breakdown */}
             <div className="bg-surface-card rounded-2xl shadow-card p-5">
               <div className="flex items-center gap-2 mb-4">
                 <Brain size={16} className="text-primary-600" />
-                <p className="text-sm font-semibold text-ink">Current Performance</p>
+                <p className="text-sm font-semibold text-ink">Performa per Template</p>
               </div>
               {performance && performance.length > 0 ? (
-                <ProgressBarList
-                  items={performance.map((p) => ({
-                    label: `${p.template_name} (${p.observation_count}x)`,
-                    value: p.avg_reward != null ? Math.round(p.avg_reward * 100) : 0,
-                    max: 100,
-                    suffix: p.avg_reward != null ? `% (avg reward ${p.avg_reward.toFixed(2)})` : " — belum ada observasi",
-                  }))}
-                />
+                <>
+                  <ProgressBarList
+                    className="mb-5"
+                    items={performance.map((p) => ({
+                      label: `${p.template_name} (${p.observation_count}x)`,
+                      value: p.avg_reward != null ? Math.round(p.avg_reward * 100) : 0,
+                      max: 100,
+                      suffix: p.avg_reward != null ? `% (avg reward ${p.avg_reward.toFixed(2)})` : " — belum ada observasi",
+                    }))}
+                  />
+                  <div className="overflow-x-auto -mx-5 px-5">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="text-ink-light border-b border-gray-100">
+                          <th className="text-left font-medium py-2 pr-3">Template</th>
+                          <th className="text-right font-medium py-2 px-2">Terkirim</th>
+                          <th className="text-right font-medium py-2 px-2">Delivered</th>
+                          <th className="text-right font-medium py-2 px-2">Read</th>
+                          <th className="text-right font-medium py-2 px-2">Replied</th>
+                          <th className="text-right font-medium py-2 px-2">Failed</th>
+                          <th className="text-right font-medium py-2 pl-2">Override rate</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {performance.map((p) => (
+                          <tr key={p.template_id} className="border-b border-gray-50 last:border-0">
+                            <td className="py-2 pr-3 text-ink font-medium">{p.template_name}</td>
+                            <td className="py-2 px-2 text-right text-ink-muted">{p.total_contacts}</td>
+                            <td className="py-2 px-2 text-right text-ink-muted">{p.delivered_count}</td>
+                            <td className="py-2 px-2 text-right text-ink-muted">{p.read_count}</td>
+                            <td className="py-2 px-2 text-right text-ink-muted">{p.replied_count}</td>
+                            <td className="py-2 px-2 text-right text-ink-muted">{p.failed_count}</td>
+                            <td className="py-2 pl-2 text-right text-ink-muted">{pct(p.override_rate)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
               ) : (
                 <p className="text-sm text-ink-muted">Belum ada template atau belum ada campaign yang selesai dipelajari.</p>
+              )}
+            </div>
+
+            {/* Grafik cumulative average reward (data nyata) */}
+            <div className="bg-surface-card rounded-2xl shadow-card p-5">
+              <div className="flex items-center gap-2 mb-2">
+                <Brain size={16} className="text-primary-600" />
+                <p className="text-sm font-semibold text-ink">Cumulative Average Reward</p>
+              </div>
+              {series && series.length > 0 ? (
+                <RewardCurveChart series={[{ label: "Reward rata-rata", color: "#22C55E", values: series.map((s) => s.cumulative_avg_reward) }]} xLabel="Campaign ke-" />
+              ) : (
+                <p className="text-sm text-ink-muted">Belum ada reward yang dihitung. Grafik akan terisi begitu campaign selesai & delay reward terlewati.</p>
+              )}
+            </div>
+
+            {/* Riwayat keputusan berpaginasi */}
+            <div className="bg-surface-card rounded-2xl shadow-card p-5">
+              <div className="flex items-center justify-between mb-4">
+                <div className="flex items-center gap-2">
+                  <History size={16} className="text-primary-600" />
+                  <p className="text-sm font-semibold text-ink">Riwayat Keputusan</p>
+                </div>
+                {decisionsPagination && (
+                  <div className="flex items-center gap-2 text-xs text-ink-muted">
+                    <button onClick={() => setDecisionsPage((p) => Math.max(1, p - 1))} disabled={decisionsPage <= 1}
+                      className="p-1 rounded-lg hover:bg-gray-100 disabled:opacity-30"><ChevronLeft size={14} /></button>
+                    Hal {decisionsPagination.page} / {Math.max(1, decisionsPagination.total_pages)}
+                    <button onClick={() => setDecisionsPage((p) => (decisionsPagination && p < decisionsPagination.total_pages ? p + 1 : p))}
+                      disabled={!decisionsPagination || decisionsPage >= decisionsPagination.total_pages}
+                      className="p-1 rounded-lg hover:bg-gray-100 disabled:opacity-30"><ChevronRight size={14} /></button>
+                  </div>
+                )}
+              </div>
+              {decisions && decisions.length > 0 ? (
+                <div className="overflow-x-auto -mx-5 px-5">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="text-ink-light border-b border-gray-100">
+                        <th className="text-left font-medium py-2 pr-3">Waktu</th>
+                        <th className="text-left font-medium py-2 px-2">Context</th>
+                        <th className="text-left font-medium py-2 px-2">Direkomendasikan</th>
+                        <th className="text-left font-medium py-2 px-2">Dipakai</th>
+                        <th className="text-center font-medium py-2 px-2">Override</th>
+                        <th className="text-right font-medium py-2 px-2">Reward</th>
+                        <th className="text-center font-medium py-2 pl-2">Status</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {decisions.map((d) => (
+                        <tr key={d.id} className="border-b border-gray-50 last:border-0">
+                          <td className="py-2 pr-3 text-ink-muted whitespace-nowrap">{new Date(d.decided_at).toLocaleString("id-ID")}</td>
+                          <td className="py-2 px-2 text-ink-muted whitespace-nowrap">{formatContext(d.context)}</td>
+                          <td className="py-2 px-2 text-ink">{d.recommended_template_name || "—"}</td>
+                          <td className="py-2 px-2 text-ink">{d.selected_template_name || "—"}</td>
+                          <td className="py-2 px-2 text-center">
+                            {d.manual_override == null ? "—" : d.manual_override ? (
+                              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 font-medium">ya</span>
+                            ) : (
+                              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-gray-100 text-gray-600 font-medium">tidak</span>
+                            )}
+                          </td>
+                          <td className="py-2 px-2 text-right text-ink-muted">{d.reward != null ? d.reward.toFixed(2) : "—"}</td>
+                          <td className="py-2 pl-2 text-center">
+                            <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${
+                              d.reward_status === "computed" ? "bg-primary-100 text-primary-700" : "bg-gray-100 text-gray-600"
+                            }`}>{d.reward_status}</span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <p className="text-sm text-ink-muted">Belum ada riwayat keputusan.</p>
+              )}
+            </div>
+
+            {/* Evaluation mode — Data Simulasi, terpisah tegas dari performa nyata di atas */}
+            <div className="rounded-2xl border-2 border-dashed border-violet-300 bg-violet-50/50 p-5">
+              <div className="flex items-center justify-between mb-1">
+                <div className="flex items-center gap-2">
+                  <FlaskConical size={16} className="text-violet-600" />
+                  <p className="text-sm font-semibold text-violet-900">Evaluation Mode</p>
+                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-violet-600 text-white font-semibold tracking-wide">DATA SIMULASI</span>
+                </div>
+                <button onClick={runSimulation} disabled={evalRunning}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-violet-600 rounded-xl hover:bg-violet-700 disabled:opacity-50 transition-all">
+                  {evalRunning ? <Loader2 size={13} className="animate-spin" /> : <FlaskConical size={13} />}
+                  {evalRunning ? "Menjalankan…" : "Jalankan Simulasi"}
+                </button>
+              </div>
+              <p className="text-xs text-violet-700 mb-4">
+                Bukan data kampanye nyata — 200 context sintetis & 3 arm sintetis dipakai untuk membandingkan LinUCB dengan
+                strategi statis (memilih template favorit tanpa mempertimbangkan context). Tidak menyentuh template atau
+                model CMAB Anda yang sesungguhnya.
+              </p>
+              {evalError && <div className="bg-red-50 border border-red-200 text-red-700 text-xs rounded-xl px-4 py-2 mb-3">{evalError}</div>}
+              {evalResult ? (
+                <div className="space-y-4">
+                  <RewardCurveChart
+                    xLabel="Context ke-"
+                    series={[
+                      { label: "LinUCB (kontekstual)", color: "#7C3AED", values: evalResult.linucb_cumulative_reward },
+                      { label: "Baseline statis", color: "#9CA3AF", values: evalResult.baseline_cumulative_reward },
+                    ]}
+                  />
+                  <div className="grid grid-cols-3 gap-3 text-center">
+                    <div className="bg-white/70 rounded-xl p-3">
+                      <p className="text-[11px] text-violet-700 font-medium">Total Reward LinUCB</p>
+                      <p className="text-lg font-bold text-violet-900">{evalResult.linucb_total.toFixed(2)}</p>
+                    </div>
+                    <div className="bg-white/70 rounded-xl p-3">
+                      <p className="text-[11px] text-violet-700 font-medium">Total Reward Baseline</p>
+                      <p className="text-lg font-bold text-violet-900">{evalResult.baseline_total.toFixed(2)}</p>
+                    </div>
+                    <div className="bg-white/70 rounded-xl p-3">
+                      <p className="text-[11px] text-violet-700 font-medium">Regret (LinUCB)</p>
+                      <p className="text-lg font-bold text-violet-900">{evalResult.regret.toFixed(2)}</p>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <p className="text-xs text-violet-600">Belum ada hasil simulasi pada sesi ini — klik &quot;Jalankan Simulasi&quot;.</p>
               )}
             </div>
 

@@ -37,4 +37,51 @@ async function latestDecision(req, res) {
   }
 }
 
-module.exports = { recommend, performance, latestDecision };
+// ── GET /api/cmab/summary ──
+async function summary(req, res) {
+  try {
+    res.json(await cmabService.getSummary(req.user.user_id));
+  } catch (err) {
+    handleError(res, err, 'CMAB summary');
+  }
+}
+
+// ── GET /api/cmab/decisions?page=&limit= ──
+async function decisions(req, res) {
+  try {
+    res.json(await cmabService.listDecisions(req.user.user_id, { page: req.query.page, limit: req.query.limit }));
+  } catch (err) {
+    handleError(res, err, 'CMAB decisions');
+  }
+}
+
+// ── GET /api/cmab/reward-timeseries ──
+async function rewardTimeseries(req, res) {
+  try {
+    res.json({ series: await cmabService.getRewardTimeseries(req.user.user_id) });
+  } catch (err) {
+    handleError(res, err, 'CMAB reward timeseries');
+  }
+}
+
+// ── POST /api/cmab/evaluate ──
+async function evaluate(req, res) {
+  const n_contexts = req.body?.n_contexts != null ? parseInt(req.body.n_contexts, 10) : undefined;
+  try {
+    const result = await cmabService.runEvaluation(req.user.user_id, { n_contexts });
+    res.status(201).json(result);
+  } catch (err) {
+    handleError(res, err, 'CMAB evaluate');
+  }
+}
+
+// ── GET /api/cmab/evaluations?page=&limit= ──
+async function evaluations(req, res) {
+  try {
+    res.json(await cmabService.listEvaluations(req.user.user_id, { page: req.query.page, limit: req.query.limit }));
+  } catch (err) {
+    handleError(res, err, 'CMAB evaluations');
+  }
+}
+
+module.exports = { recommend, performance, latestDecision, summary, decisions, rewardTimeseries, evaluate, evaluations };

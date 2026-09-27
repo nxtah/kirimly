@@ -27,6 +27,14 @@ export interface CmabPerformanceRow {
   observation_count: number;
   cumulative_reward: number;
   avg_reward: number | null;
+  total_contacts: number;
+  delivered_count: number;
+  read_count: number;
+  replied_count: number;
+  failed_count: number;
+  recommended_count: number;
+  override_count: number;
+  override_rate: number | null;
 }
 
 export interface CmabDecision {
@@ -36,10 +44,55 @@ export interface CmabDecision {
   recommended_template_name: string | null;
   selected_template_id: number | null;
   selected_template_name: string | null;
+  manual_override: boolean | null;
+  reward_status: "pending" | "computed";
   reward: number | null;
   decided_at: string;
   linked_at: string | null;
   reward_computed_at: string | null;
+}
+
+export interface CmabSummary {
+  arms: number;
+  decisions: number;
+  observations: number;
+  pending_rewards: number;
+}
+
+export interface Pagination {
+  page: number;
+  limit: number;
+  total: number;
+  total_pages: number;
+}
+
+export interface CmabRewardPoint {
+  decision_id: number;
+  reward: number;
+  reward_computed_at: string;
+  template_name: string | null;
+  cumulative_avg_reward: number;
+}
+
+export interface CmabSyntheticArm {
+  id: number;
+  name: string;
+  preferred_hour_bucket: number;
+  preferred_audience_bucket: number;
+  base_rate: number;
+}
+
+export interface CmabEvaluationResult {
+  id: number;
+  created_at?: string;
+  n_contexts: number;
+  seed: number;
+  arms: CmabSyntheticArm[];
+  linucb_cumulative_reward: number[];
+  baseline_cumulative_reward: number[];
+  linucb_total: number;
+  baseline_total: number;
+  regret: number;
 }
 
 const HOUR_BUCKET_LABELS: Record<string, string> = {

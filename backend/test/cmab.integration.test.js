@@ -383,3 +383,150 @@ test('performance & latest decision terisi, dan terisolasi per user', async () =
   const perfB = await call('GET', '/api/cmab/performance', { token: tokenB });
   assert.ok(perfB.data.performance.every((p) => p.template_name !== 'Promo Kilat' && p.template_name !== 'Info Reguler'), 'user B tidak melihat arm milik user A');
 });
+
+/* ───────────────────────── manual_override & reward_status (kolom eksplisit) ───────────────────────── */
+
+test('manual_override tersimpan eksplisit: true saat template diganti, false saat dipakai sesuai rekomendasi', async () => {
+  const contacts1 = await createContacts(tokenA, 1, 'mo1');
+  installFakeSession(idA, async () => ({ key: { id: `WAMO1-${suffix}-${Math.random()}` } }));
+  const rec1 = await call('POST', '/api/cmab/recommend', { token: tokenA });
+  const blast1 = await sendBlastAndBackdate(tokenA, rec1.data.recommended_template_id, contacts1, rec1.data.decision_id, 3);
+  const dec1 = (await pool.query('SELECT manual_override FROM cmab_decisions WHERE blast_id=$1', [blast1])).rows[0];
+  assert.equal(dec1.manual_override, false, 'dipakai sesuai rekomendasi -> manual_override=false');
+
+  const contacts2 = await createContacts(tokenA, 1, 'mo2');
+  installFakeSession(idA, async () => ({ key: { id: `WAMO2-${suffix}-${Math.random()}` } }));
+  const rec2 = await call('POST', '/api/cmab/recommend', { token: tokenA });
+  const other = rec2.data.recommended_template_id === templateA1 ? templateA2 : templateA1;
+  const blast2 = await sendBlastAndBackdate(tokenA, other, contacts2, rec2.data.decision_id, 3);
+  const dec2 = (await pool.query('SELECT manual_override FROM cmab_decisions WHERE blast_id=$1', [blast2])).rows[0];
+  assert.equal(dec2.manual_override, true, 'diganti manual -> manual_override=true');
+});
+
+test('reward_status: pending sebelum jatuh tempo, computed setelah diproses, tetap computed (tidak diproses ulang)', async () => {
+  const contacts = await createContacts(tokenA, 1, 'rs');
+  installFakeSession(idA, async () => ({ key: { id: `WARS-${suffix}-${Math.random()}` } }));
+  const rec = await call('POST', '/api/cmab/recommend', { token: tokenA });
+  const blastId = await sendBlastAndBackdate(tokenA, rec.data.recommended_template_id, contacts, rec.data.decision_id, 3);
+
+  const before = (await pool.query('SELECT reward_status FROM cmab_decisions WHERE blast_id=$1', [blastId])).rows[0];
+  assert.equal(before.reward_status, 'pending');
+
+  await cmabService.processDueRewards();
+  const after = (await pool.query('SELECT reward_status, reward_computed_at FROM cmab_decisions WHERE blast_id=$1', [blastId])).rows[0];
+  assert.equal(after.reward_status, 'computed');
+  const computedAt = after.reward_computed_at;
+
+  await cmabService.processDueRewards();
+  const again = (await pool.query('SELECT reward_status, reward_computed_at FROM cmab_decisions WHERE blast_id=$1', [blastId])).rows[0];
+  assert.equal(again.reward_status, 'computed');
+  assert.deepEqual(again.reward_computed_at, computedAt, 'dipanggil lagi tidak mengubah waktu perhitungan reward');
+});
+
+/* ───────────────────────── analytics: summary, decisions, reward-timeseries, performance breakdown ───────────────────────── */
+
+test('GET /api/cmab/summary: total arm/keputusan/observasi/pending reward dari DB, bukan angka statis', async () => {
+  const r = await call('GET', '/api/cmab/summary', { token: tokenA });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  const [{ n: arms }, { n: decisions }, { rows: obsRows }] = await Promise.all([
+    pool.query('SELECT COUNT(*)::int n FROM cmab_models WHERE user_id=$1', [idA]).then((x) => x.rows[0]),
+    pool.query('SELECT COUNT(*)::int n FROM cmab_decisions WHERE user_id=$1', [idA]).then((x) => x.rows[0]),
+    pool.query('SELECT COALESCE(SUM(observation_count),0)::int n FROM cmab_models WHERE user_id=$1', [idA]),
+  ]);
+  assert.equal(r.data.arms, arms);
+  assert.equal(r.data.decisions, decisions);
+  assert.equal(r.data.observations, obsRows[0].n);
+  assert.equal(typeof r.data.pending_rewards, 'number');
+  assert.equal((await call('GET', '/api/cmab/summary')).status, 401);
+});
+
+test('GET /api/cmab/decisions: riwayat berpaginasi, termasuk manual_override & reward_status', async () => {
+  const r = await call('GET', '/api/cmab/decisions', { token: tokenA, query: { limit: '3', page: '1' } });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.ok(r.data.decisions.length <= 3);
+  assert.equal(r.data.pagination.limit, 3);
+  assert.ok(r.data.pagination.total >= r.data.decisions.length);
+  for (const d of r.data.decisions) {
+    assert.ok('manual_override' in d);
+    assert.ok(['pending', 'computed'].includes(d.reward_status));
+    assert.ok(d.context && typeof d.context === 'object');
+  }
+  // paginasi konsisten: total_pages * limit >= total
+  assert.ok(r.data.pagination.total_pages * r.data.pagination.limit >= r.data.pagination.total);
+
+  // terisolasi per user
+  const rB = await call('GET', '/api/cmab/decisions', { token: tokenB });
+  const crossCheck = await pool.query('SELECT COUNT(*)::int n FROM cmab_decisions WHERE id = ANY($1) AND user_id <> $2', [rB.data.decisions.map((d) => d.id), idB]);
+  assert.equal(crossCheck.rows[0].n, 0, 'user B tidak melihat decision milik user lain');
+});
+
+test('GET /api/cmab/reward-timeseries: seri cumulative average reward, urut waktu, dihitung dari data nyata', async () => {
+  const r = await call('GET', '/api/cmab/reward-timeseries', { token: tokenA });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.ok(r.data.series.length > 0, 'sudah ada beberapa reward dihitung dari test sebelumnya');
+  for (let i = 1; i < r.data.series.length; i++) {
+    assert.ok(new Date(r.data.series[i].reward_computed_at) >= new Date(r.data.series[i - 1].reward_computed_at), 'urut waktu naik');
+  }
+  // cumulative_avg_reward harus konsisten dengan reward mentahnya (dihitung ulang manual)
+  let sum = 0;
+  r.data.series.forEach((row, i) => {
+    sum += row.reward;
+    assert.ok(Math.abs(row.cumulative_avg_reward - sum / (i + 1)) < 1e-9);
+  });
+});
+
+test('GET /api/cmab/performance: breakdown delivered/read/replied/failed & override_rate dari DB', async () => {
+  const r = await call('GET', '/api/cmab/performance', { token: tokenA });
+  assert.equal(r.status, 200);
+  for (const p of r.data.performance) {
+    for (const f of ['total_contacts', 'delivered_count', 'read_count', 'replied_count', 'failed_count']) {
+      assert.equal(typeof p[f], 'number', `${f} harus number`);
+    }
+    assert.ok(p.override_rate === null || (p.override_rate >= 0 && p.override_rate <= 1));
+  }
+  // reward penuh test sebelumnya memberi 2 delivered + 2 read pada salah satu arm
+  const withDelivery = r.data.performance.find((p) => p.delivered_count > 0);
+  assert.ok(withDelivery, 'setidaknya satu arm punya delivered_count > 0 dari test sebelumnya');
+});
+
+/* ───────────────────────── evaluation mode: terisolasi dari data nyata ───────────────────────── */
+
+test('POST /api/cmab/evaluate: simulasi LinUCB vs baseline, TIDAK menulis ke cmab_models/cmab_decisions', async () => {
+  const before = await Promise.all([
+    pool.query('SELECT COUNT(*)::int n FROM cmab_models'),
+    pool.query('SELECT COUNT(*)::int n FROM cmab_decisions'),
+  ]);
+
+  const r = await call('POST', '/api/cmab/evaluate', { token: tokenA, body: { n_contexts: 120 } });
+  assert.equal(r.status, 201, JSON.stringify(r.data));
+  assert.equal(r.data.n_contexts, 120);
+  assert.equal(r.data.arms.length, 3);
+  assert.equal(r.data.linucb_cumulative_reward.length, 120);
+  assert.equal(r.data.baseline_cumulative_reward.length, 120);
+  assert.equal(typeof r.data.regret, 'number');
+  assert.ok(r.data.id, 'hasil simulasi tersimpan (punya id)');
+
+  const after = await Promise.all([
+    pool.query('SELECT COUNT(*)::int n FROM cmab_models'),
+    pool.query('SELECT COUNT(*)::int n FROM cmab_decisions'),
+  ]);
+  assert.equal(after[0].rows[0].n, before[0].rows[0].n, 'evaluate tidak menambah baris cmab_models (arm nyata)');
+  assert.equal(after[1].rows[0].n, before[1].rows[0].n, 'evaluate tidak menambah baris cmab_decisions (keputusan nyata)');
+
+  const simRow = (await pool.query('SELECT user_id, n_contexts FROM cmab_simulations WHERE id=$1', [r.data.id])).rows[0];
+  assert.equal(simRow.user_id, idA);
+  assert.equal(simRow.n_contexts, 120);
+
+  assert.equal((await call('POST', '/api/cmab/evaluate')).status, 401);
+});
+
+test('GET /api/cmab/evaluations: riwayat simulasi berpaginasi, terisolasi per user', async () => {
+  await call('POST', '/api/cmab/evaluate', { token: tokenA, body: { n_contexts: 100 } });
+  const r = await call('GET', '/api/cmab/evaluations', { token: tokenA, query: { limit: '1', page: '1' } });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(r.data.evaluations.length, 1);
+  assert.ok(r.data.pagination.total >= 2, 'setidaknya 2 simulasi tersimpan dari test sebelumnya');
+
+  const rB = await call('GET', '/api/cmab/evaluations', { token: tokenB });
+  assert.equal(rB.data.evaluations.length, 0, 'user B belum pernah menjalankan simulasi');
+});

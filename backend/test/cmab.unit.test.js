@@ -8,6 +8,7 @@ const assert = require('node:assert/strict');
 const { initModel, computeUcbScore, selectArm, updateModel, invert } = require('../src/cmab/linucb');
 const { buildContext, DIMENSION, hourBucket, hashToBucket } = require('../src/cmab/context');
 const { computeReward } = require('../src/cmab/reward');
+const { runEvaluation, generateContexts, buildSyntheticArms, expectedReward, MIN_CONTEXTS, MAX_CONTEXTS } = require('../src/cmab/evaluate');
 
 /* ───────────── linucb: cold start & dasar ───────────── */
 
@@ -182,4 +183,69 @@ test('computeReward: agregat multi-kontak (T=10)', () => {
 test('computeReward: total_contacts 0 atau tidak ada -> 0 (tidak error)', () => {
   assert.equal(computeReward({ total_contacts: 0, delivered_count: 0, read_count: 0, replied_count: 0 }), 0);
   assert.equal(computeReward({ total_contacts: null, delivered_count: 0, read_count: 0, replied_count: 0 }), 0);
+});
+
+/* ───────────── evaluate (evaluation mode / Data Simulasi) ───────────── */
+
+test('generateContexts: deterministik ber-seed, jumlah sesuai, dalam rentang valid', () => {
+  const a = generateContexts(120, 42);
+  const b = generateContexts(120, 42);
+  assert.deepEqual(a, b, 'seed sama -> context sintetis identik');
+  assert.equal(a.length, 120);
+  for (const c of a) {
+    assert.ok(c.dayOfWeek >= 0 && c.dayOfWeek <= 6);
+    assert.ok(c.hour >= 0 && c.hour <= 23);
+    assert.ok(c.audienceLabel === null || typeof c.audienceLabel === 'string');
+  }
+  const c2 = generateContexts(120, 99);
+  assert.notDeepEqual(a, c2, 'seed beda -> context berbeda');
+});
+
+test('buildSyntheticArms: 3 arm, preferensi tetap, tidak menyentuh template asli', () => {
+  const arms = buildSyntheticArms();
+  assert.equal(arms.length, 3);
+  assert.deepEqual(arms.map((a) => a.id), [0, 1, 2]);
+  assert.ok(arms.every((a) => a.name.startsWith('Simulasi')));
+  assert.ok(new Set(arms.map((a) => a.preferred_hour_bucket)).size >= 2, 'preferensi jam bervariasi antar arm');
+});
+
+test('expectedReward: arm mendapat bonus saat bucket jam/audience favoritnya cocok', () => {
+  const arms = buildSyntheticArms();
+  const arm = arms[0];
+  const withMatch = expectedReward(arm, arm.preferred_hour_bucket, arm.preferred_audience_bucket);
+  const noMatch = expectedReward(arm, (arm.preferred_hour_bucket + 1) % 4, (arm.preferred_audience_bucket + 1) % 7);
+  assert.ok(withMatch > noMatch, 'bucket favorit harus menghasilkan expected reward lebih tinggi');
+  assert.ok(withMatch <= 1 && noMatch >= 0, 'reward tetap dalam rentang [0,1]');
+});
+
+test('runEvaluation: minimal 100 context, 3 arm sintetis, dua kurva sepanjang n_contexts, deterministik', () => {
+  const r = runEvaluation({ n_contexts: 100, seed: 7 });
+  assert.equal(r.n_contexts, 100);
+  assert.equal(r.arms.length, 3);
+  assert.equal(r.linucb_cumulative_reward.length, 100);
+  assert.equal(r.baseline_cumulative_reward.length, 100);
+  assert.equal(typeof r.linucb_total, 'number');
+  assert.equal(typeof r.baseline_total, 'number');
+  assert.ok(r.regret >= 0, 'regret (jarak ke arm optimal) tidak boleh negatif');
+  for (const v of [...r.linucb_cumulative_reward, ...r.baseline_cumulative_reward]) {
+    assert.ok(v >= 0 && v <= 1.1, `kurva reward kumulatif ${v} harus mendekati rentang [0,1]`);
+  }
+
+  const again = runEvaluation({ n_contexts: 100, seed: 7 });
+  assert.deepEqual(r.linucb_cumulative_reward, again.linucb_cumulative_reward, 'seed sama -> hasil reproducible (bukti untuk laporan)');
+  assert.equal(r.linucb_total, again.linucb_total);
+});
+
+test('runEvaluation: n_contexts di-clamp ke [MIN_CONTEXTS, MAX_CONTEXTS]', () => {
+  assert.equal(runEvaluation({ n_contexts: 10, seed: 1 }).n_contexts, MIN_CONTEXTS);
+  assert.equal(runEvaluation({ n_contexts: 5000, seed: 1 }).n_contexts, MAX_CONTEXTS);
+  assert.equal(runEvaluation({ seed: 1 }).n_contexts, MIN_CONTEXTS, 'default juga >= 100');
+});
+
+test('runEvaluation: LinUCB (pakai context) mengungguli baseline statis (context-blind) setelah cukup observasi', () => {
+  const r = runEvaluation({ n_contexts: 400, seed: 2024 });
+  assert.ok(
+    r.linucb_cumulative_reward.at(-1) > r.baseline_cumulative_reward.at(-1),
+    `LinUCB (${r.linucb_cumulative_reward.at(-1)}) harus mengungguli baseline (${r.baseline_cumulative_reward.at(-1)}) karena arm sintetis punya preferensi context yang bisa dipelajari`
+  );
 });
