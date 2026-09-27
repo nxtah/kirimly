@@ -70,4 +70,33 @@ function buildContext({ dayOfWeek, hour, audienceLabel }) {
   return { vector, label };
 }
 
-module.exports = { buildContext, DIMENSION, hourBucket, hashToBucket };
+const DAY_NAMES = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
+
+/**
+ * Peta 19 dimensi context vector secara eksplisit — indeks, kelompok, label, dan cara
+ * encoding-nya. Dipakai oleh `GET /api/cmab/evaluation-config` untuk dokumentasi di halaman
+ * CMAB (Evaluation Mode) supaya mapping/encoding-nya bisa diaudit, bukan cuma di komentar kode.
+ */
+function describeDimensions() {
+  const dims = [];
+  for (let i = 0; i < DAY_WIDTH; i++) {
+    dims.push({ index: i, group: 'day_of_week', label: DAY_NAMES[i], encoding: 'one-hot' });
+  }
+  for (let i = 0; i < HOUR_WIDTH; i++) {
+    dims.push({ index: DAY_WIDTH + i, group: 'hour_bucket', label: HOUR_BUCKET_LABELS[i], encoding: 'one-hot' });
+  }
+  const audienceOffset = DAY_WIDTH + HOUR_WIDTH;
+  for (let i = 0; i < AUDIENCE_BUCKETS; i++) {
+    dims.push({ index: audienceOffset + i, group: 'audience', label: `hash bucket ${i}`, encoding: 'one-hot (djb2 hash mod 6)' });
+  }
+  dims.push({ index: audienceOffset + AUDIENCE_BUCKETS, group: 'audience', label: 'general (tanpa audience)', encoding: 'one-hot' });
+  dims.push({ index: DIMENSION - 1, group: 'bias', label: 'bias (selalu 1)', encoding: 'constant' });
+
+  return {
+    dimension: DIMENSION,
+    groups: { day_of_week: DAY_WIDTH, hour_bucket: HOUR_WIDTH, audience: AUDIENCE_BUCKETS + 1, bias: 1 },
+    dims,
+  };
+}
+
+module.exports = { buildContext, DIMENSION, hourBucket, hashToBucket, describeDimensions };

@@ -7,7 +7,7 @@ const pool = require('../config/database');
 const { buildContext, DIMENSION } = require('./context');
 const { initModel, selectArm, updateModel } = require('./linucb');
 const { computeReward } = require('./reward');
-const { runEvaluation: computeEvaluation } = require('./evaluate');
+const { runEvaluation: computeEvaluation, getEvaluationConfig: computeEvaluationConfig } = require('./evaluate');
 
 const ALPHA = parseFloat(process.env.CMAB_ALPHA) || 0.3;
 const REWARD_DELAY_HOURS = parseFloat(process.env.CMAB_REWARD_DELAY_HOURS) || 2;
@@ -333,26 +333,54 @@ async function listDecisions(userId, { page = 1, limit = 20 } = {}) {
 
 /* ───────────────────────── evaluation mode (simulasi) ───────────────────────── */
 
+/** Dokumentasi Evaluation Mode (context schema, mekanisme arm/reward, definisi baseline & regret) tanpa menjalankan apa pun. */
+function getEvaluationConfig() {
+  return computeEvaluationConfig();
+}
+
 /**
- * Jalankan simulasi LinUCB vs baseline statis pada context/arm SINTETIS (evaluate.js) dan
- * simpan hasilnya ke `cmab_simulations` — tabel terpisah, TIDAK PERNAH menulis ke
- * cmab_models/cmab_decisions, supaya data simulasi tidak bisa tercampur ke analytics nyata.
+ * Jalankan simulasi (banyak trial) LinUCB vs baseline statis pada context/arm SINTETIS
+ * (evaluate.js) dan simpan hasilnya ke `cmab_simulations` — tabel terpisah, TIDAK PERNAH
+ * menulis ke cmab_models/cmab_decisions, supaya data simulasi tidak bisa tercampur ke
+ * analytics nyata. Kolom lama (linucb_total/baseline_total/regret) diisi nilai RATA-RATA
+ * di seluruh trial supaya tetap bermakna untuk baris yang dibuat sebelum ada banyak trial.
  */
 async function runEvaluation(userId, params = {}) {
   const result = computeEvaluation(params);
   const { rows } = await pool.query(
     `INSERT INTO cmab_simulations
        (user_id, n_contexts, seed, arms, linucb_cumulative_reward, baseline_cumulative_reward,
-        linucb_total, baseline_total, regret)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        linucb_total, baseline_total, regret, alpha, n_trials, trials,
+        linucb_std, linucb_ci_low, linucb_ci_high, baseline_std, baseline_ci_low, baseline_ci_high,
+        improvement_pct, std_regret)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
      RETURNING id, created_at`,
     [
-      userId, result.n_contexts, result.seed, JSON.stringify(result.arms),
-      JSON.stringify(result.linucb_cumulative_reward), JSON.stringify(result.baseline_cumulative_reward),
-      result.linucb_total, result.baseline_total, result.regret,
+      userId, result.config.n_contexts, result.config.seed, JSON.stringify(result.arms),
+      JSON.stringify(result.linucb.cumulative_avg_curve), JSON.stringify(result.baseline.cumulative_avg_curve),
+      result.linucb.mean_total, result.baseline.mean_total, result.avg_regret,
+      result.config.alpha, result.config.n_trials, JSON.stringify(result.trials),
+      result.linucb.std_total, result.linucb.ci95[0], result.linucb.ci95[1],
+      result.baseline.std_total, result.baseline.ci95[0], result.baseline.ci95[1],
+      result.improvement_pct, result.std_regret,
     ]
   );
   return { id: rows[0].id, created_at: rows[0].created_at, ...result };
+}
+
+function rowToEvaluation(row) {
+  return {
+    id: row.id,
+    created_at: row.created_at,
+    config: { alpha: row.alpha, n_contexts: row.n_contexts, n_trials: row.n_trials, seed: Number(row.seed) },
+    arms: row.arms,
+    linucb: { mean_total: row.linucb_total, std_total: row.linucb_std, ci95: [row.linucb_ci_low, row.linucb_ci_high], cumulative_avg_curve: row.linucb_cumulative_reward },
+    baseline: { mean_total: row.baseline_total, std_total: row.baseline_std, ci95: [row.baseline_ci_low, row.baseline_ci_high], cumulative_avg_curve: row.baseline_cumulative_reward },
+    improvement_pct: row.improvement_pct,
+    avg_regret: row.regret,
+    std_regret: row.std_regret,
+    trials: row.trials,
+  };
 }
 
 async function listEvaluations(userId, { page = 1, limit = 10 } = {}) {
@@ -362,7 +390,10 @@ async function listEvaluations(userId, { page = 1, limit = 10 } = {}) {
   const [data, total] = await Promise.all([
     pool.query(
       `SELECT id, n_contexts, seed, arms, linucb_cumulative_reward, baseline_cumulative_reward,
-              linucb_total, baseline_total, regret, created_at
+              linucb_total, baseline_total, regret, alpha, n_trials, trials,
+              linucb_std::float8 AS linucb_std, linucb_ci_low::float8 AS linucb_ci_low, linucb_ci_high::float8 AS linucb_ci_high,
+              baseline_std::float8 AS baseline_std, baseline_ci_low::float8 AS baseline_ci_low, baseline_ci_high::float8 AS baseline_ci_high,
+              improvement_pct::float8 AS improvement_pct, std_regret::float8 AS std_regret, created_at
        FROM cmab_simulations WHERE user_id = $1
        ORDER BY created_at DESC, id DESC
        LIMIT $2 OFFSET $3`,
@@ -372,7 +403,21 @@ async function listEvaluations(userId, { page = 1, limit = 10 } = {}) {
   ]);
 
   const n = total.rows[0].n;
-  return { evaluations: data.rows, pagination: { page: p, limit: l, total: n, total_pages: Math.ceil(n / l) } };
+  return { evaluations: data.rows.map(rowToEvaluation), pagination: { page: p, limit: l, total: n, total_pages: Math.ceil(n / l) } };
+}
+
+async function getEvaluation(userId, id) {
+  const { rows } = await pool.query(
+    `SELECT id, n_contexts, seed, arms, linucb_cumulative_reward, baseline_cumulative_reward,
+            linucb_total, baseline_total, regret, alpha, n_trials, trials,
+            linucb_std::float8 AS linucb_std, linucb_ci_low::float8 AS linucb_ci_low, linucb_ci_high::float8 AS linucb_ci_high,
+            baseline_std::float8 AS baseline_std, baseline_ci_low::float8 AS baseline_ci_low, baseline_ci_high::float8 AS baseline_ci_high,
+            improvement_pct::float8 AS improvement_pct, std_regret::float8 AS std_regret, created_at
+     FROM cmab_simulations WHERE id = $1 AND user_id = $2`,
+    [id, userId]
+  );
+  if (!rows[0]) return null;
+  return rowToEvaluation(rows[0]);
 }
 
 async function getLatestDecision(userId) {
@@ -401,6 +446,8 @@ module.exports = {
   getSummary,
   getRewardTimeseries,
   listDecisions,
+  getEvaluationConfig,
   runEvaluation,
   listEvaluations,
+  getEvaluation,
 };

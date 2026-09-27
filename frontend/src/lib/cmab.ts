@@ -79,21 +79,74 @@ export interface CmabSyntheticArm {
   name: string;
   preferred_hour_bucket: number;
   preferred_audience_bucket: number;
-  base_rate: number;
+  base_delivered: number;
+  base_read: number;
+  base_replied: number;
+}
+
+export interface CmabContextDim {
+  index: number;
+  group: "day_of_week" | "hour_bucket" | "audience" | "bias";
+  label: string;
+  encoding: string;
+}
+
+export interface CmabContextSchema {
+  dimension: number;
+  groups: Record<string, number>;
+  dims: CmabContextDim[];
+}
+
+export interface CmabRewardFormula {
+  production: string;
+  simulation: string;
+  weights: { delivered: number; read: number; replied: number };
+}
+
+export interface CmabEvaluationConfig {
+  context_schema: CmabContextSchema;
+  arms: CmabSyntheticArm[];
+  reward_formula: CmabRewardFormula;
+  baseline_definition: string;
+  regret_formula: string;
+  default_alpha: number;
+  bounds: { min_contexts: number; max_contexts: number; min_trials: number; max_trials: number };
+}
+
+export interface CmabEvaluationTrial {
+  trial_index: number;
+  seed: number;
+  linucb_total: number;
+  baseline_total: number;
+  regret: number;
+}
+
+export interface CmabStrategyStats {
+  mean_total: number;
+  std_total: number;
+  ci95: [number, number];
+  cumulative_avg_curve: number[];
 }
 
 export interface CmabEvaluationResult {
   id: number;
   created_at?: string;
-  n_contexts: number;
-  seed: number;
+  config: { alpha: number; n_contexts: number; n_trials: number; seed: number };
   arms: CmabSyntheticArm[];
-  linucb_cumulative_reward: number[];
-  baseline_cumulative_reward: number[];
-  linucb_total: number;
-  baseline_total: number;
-  regret: number;
+  context_schema: CmabContextSchema;
+  reward_formula: CmabRewardFormula;
+  baseline_definition: string;
+  regret_formula: string;
+  linucb: CmabStrategyStats;
+  baseline: CmabStrategyStats;
+  improvement_pct: number | null;
+  avg_regret: number;
+  std_regret: number;
+  trials: CmabEvaluationTrial[];
 }
+
+/** Bentuk yang dikembalikan `GET /evaluations` & `/evaluations/:id` — sama seperti hasil run, minus dokumentasi statis (schema/formula/definisi) yang sudah tersedia lewat `GET /evaluation-config`. */
+export type CmabEvaluationSummary = Omit<CmabEvaluationResult, "context_schema" | "reward_formula" | "baseline_definition" | "regret_formula">;
 
 const HOUR_BUCKET_LABELS: Record<string, string> = {
   night: "Malam (00–05)",

@@ -491,20 +491,59 @@ test('GET /api/cmab/performance: breakdown delivered/read/replied/failed & overr
 
 /* ───────────────────────── evaluation mode: terisolasi dari data nyata ───────────────────────── */
 
-test('POST /api/cmab/evaluate: simulasi LinUCB vs baseline, TIDAK menulis ke cmab_models/cmab_decisions', async () => {
+test('GET /api/cmab/evaluation-config: mapping context vector 19 dim, arm sintetis, rumus reward/baseline/regret', async () => {
+  const r = await call('GET', '/api/cmab/evaluation-config', { token: tokenA });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+
+  assert.equal(r.data.context_schema.dimension, 19);
+  assert.equal(r.data.context_schema.dims.length, 19);
+  assert.deepEqual(r.data.context_schema.dims.map((d) => d.index), Array.from({ length: 19 }, (_, i) => i));
+  const sumGroups = Object.values(r.data.context_schema.groups).reduce((a, b) => a + b, 0);
+  assert.equal(sumGroups, 19);
+
+  assert.equal(r.data.arms.length, 3);
+  assert.deepEqual(r.data.arms.map((a) => a.name).sort(), ['Informatif', 'Persuasif', 'Urgency']);
+
+  // reward simulasi harus SAMA PERSIS dengan formula produksi (bukan cuma "mirip")
+  assert.equal(r.data.reward_formula.weights.delivered, 0.2);
+  assert.equal(r.data.reward_formula.weights.read, 0.3);
+  assert.equal(r.data.reward_formula.weights.replied, 0.5);
+  assert.match(r.data.reward_formula.production, /0\.2.*0\.3.*0\.5/s);
+
+  assert.match(r.data.baseline_definition, /context-blind|tanpa context/i);
+  assert.match(r.data.regret_formula, /regret/i);
+  assert.ok(r.data.bounds.min_trials >= 30, 'batas bawah jumlah percobaan minimal 30');
+
+  assert.equal((await call('GET', '/api/cmab/evaluation-config')).status, 401);
+});
+
+test('POST /api/cmab/evaluate: minimal 30 trial otomatis, TIDAK menulis ke cmab_models/cmab_decisions', async () => {
   const before = await Promise.all([
     pool.query('SELECT COUNT(*)::int n FROM cmab_models'),
     pool.query('SELECT COUNT(*)::int n FROM cmab_decisions'),
   ]);
 
-  const r = await call('POST', '/api/cmab/evaluate', { token: tokenA, body: { n_contexts: 120 } });
+  const r = await call('POST', '/api/cmab/evaluate', { token: tokenA, body: { n_contexts: 100, seed: 777 } });
   assert.equal(r.status, 201, JSON.stringify(r.data));
-  assert.equal(r.data.n_contexts, 120);
-  assert.equal(r.data.arms.length, 3);
-  assert.equal(r.data.linucb_cumulative_reward.length, 120);
-  assert.equal(r.data.baseline_cumulative_reward.length, 120);
-  assert.equal(typeof r.data.regret, 'number');
-  assert.ok(r.data.id, 'hasil simulasi tersimpan (punya id)');
+  const d = r.data;
+
+  assert.equal(d.config.n_contexts, 100);
+  assert.ok(d.config.n_trials >= 30, 'jumlah percobaan tidak diminta -> otomatis minimal 30');
+  assert.equal(d.trials.length, d.config.n_trials);
+  assert.equal(d.arms.length, 3);
+  assert.equal(d.linucb.cumulative_avg_curve.length, 100);
+  assert.equal(d.baseline.cumulative_avg_curve.length, 100);
+
+  for (const grp of [d.linucb, d.baseline]) {
+    for (const f of ['mean_total', 'std_total']) assert.equal(typeof grp[f], 'number');
+    assert.equal(grp.ci95.length, 2);
+    assert.ok(grp.ci95[0] <= grp.mean_total && grp.mean_total <= grp.ci95[1], 'mean berada di dalam CI95 sendiri');
+  }
+  assert.equal(typeof d.improvement_pct, 'number');
+  assert.equal(typeof d.avg_regret, 'number');
+  assert.equal(typeof d.std_regret, 'number');
+  assert.ok(d.avg_regret >= 0);
+  assert.ok(d.id, 'hasil simulasi tersimpan (punya id)');
 
   const after = await Promise.all([
     pool.query('SELECT COUNT(*)::int n FROM cmab_models'),
@@ -513,20 +552,80 @@ test('POST /api/cmab/evaluate: simulasi LinUCB vs baseline, TIDAK menulis ke cma
   assert.equal(after[0].rows[0].n, before[0].rows[0].n, 'evaluate tidak menambah baris cmab_models (arm nyata)');
   assert.equal(after[1].rows[0].n, before[1].rows[0].n, 'evaluate tidak menambah baris cmab_decisions (keputusan nyata)');
 
-  const simRow = (await pool.query('SELECT user_id, n_contexts FROM cmab_simulations WHERE id=$1', [r.data.id])).rows[0];
+  const simRow = (await pool.query('SELECT user_id, n_contexts, n_trials FROM cmab_simulations WHERE id=$1', [d.id])).rows[0];
   assert.equal(simRow.user_id, idA);
-  assert.equal(simRow.n_contexts, 120);
+  assert.equal(simRow.n_contexts, 100);
+  assert.equal(simRow.n_trials, d.config.n_trials);
 
   assert.equal((await call('POST', '/api/cmab/evaluate')).status, 401);
 });
 
-test('GET /api/cmab/evaluations: riwayat simulasi berpaginasi, terisolasi per user', async () => {
-  await call('POST', '/api/cmab/evaluate', { token: tokenA, body: { n_contexts: 100 } });
+test('POST /api/cmab/evaluate: alpha/seed/n_trials terkonfigurasi, n_trials di-clamp minimal 30, hasil reproducible dari seed yang sama', async () => {
+  const rejected = await call('POST', '/api/cmab/evaluate', { token: tokenA, body: { n_contexts: 100, n_trials: 5, seed: 555 } });
+  assert.equal(rejected.status, 201);
+  assert.ok(rejected.data.config.n_trials >= 30, 'n_trials < 30 di-clamp ke minimal 30, bukan dituruti mentah-mentah');
+
+  const r1 = await call('POST', '/api/cmab/evaluate', { token: tokenA, body: { alpha: 0.8, n_contexts: 100, n_trials: 30, seed: 999 } });
+  const r2 = await call('POST', '/api/cmab/evaluate', { token: tokenA, body: { alpha: 0.8, n_contexts: 100, n_trials: 30, seed: 999 } });
+  assert.equal(r1.data.config.alpha, 0.8);
+  assert.deepEqual(r1.data.linucb.cumulative_avg_curve, r2.data.linucb.cumulative_avg_curve, 'seed sama -> kurva identik (reproducible)');
+  assert.equal(r1.data.linucb.mean_total, r2.data.linucb.mean_total);
+  assert.deepEqual(r1.data.trials.map((t) => t.seed), r2.data.trials.map((t) => t.seed), 'seed per-trial diturunkan deterministik dari base seed');
+});
+
+test('GET /api/cmab/evaluations & /:id: riwayat simulasi berpaginasi + detail, terisolasi per user', async () => {
+  const created = await call('POST', '/api/cmab/evaluate', { token: tokenA, body: { n_contexts: 100, seed: 111 } });
   const r = await call('GET', '/api/cmab/evaluations', { token: tokenA, query: { limit: '1', page: '1' } });
   assert.equal(r.status, 200, JSON.stringify(r.data));
   assert.equal(r.data.evaluations.length, 1);
-  assert.ok(r.data.pagination.total >= 2, 'setidaknya 2 simulasi tersimpan dari test sebelumnya');
+  assert.ok(r.data.pagination.total >= 4, 'setidaknya 4 simulasi tersimpan dari test sebelumnya');
+
+  const detail = await call('GET', `/api/cmab/evaluations/${created.data.id}`, { token: tokenA });
+  assert.equal(detail.status, 200);
+  assert.equal(detail.data.evaluation.id, created.data.id);
+  assert.equal(detail.data.evaluation.trials.length, created.data.config.n_trials);
+  assert.equal(detail.data.evaluation.linucb.mean_total, created.data.linucb.mean_total);
 
   const rB = await call('GET', '/api/cmab/evaluations', { token: tokenB });
   assert.equal(rB.data.evaluations.length, 0, 'user B belum pernah menjalankan simulasi');
+  assert.equal((await call('GET', `/api/cmab/evaluations/${created.data.id}`, { token: tokenB })).status, 404, 'evaluasi milik user lain tidak terlihat');
+  assert.equal((await call('GET', '/api/cmab/evaluations/999999999', { token: tokenA })).status, 404);
+});
+
+test('GET /api/cmab/evaluations/:id/export: CSV & JSON berisi angka yang sama dengan hasil tersimpan', async () => {
+  const created = await call('POST', '/api/cmab/evaluate', { token: tokenA, body: { n_contexts: 100, seed: 222 } });
+  const id = created.data.id;
+
+  const csvRes = await fetch(`${base}/api/cmab/evaluations/${id}/export?format=csv`, { headers: { Authorization: `Bearer ${tokenA}` } });
+  assert.equal(csvRes.status, 200);
+  assert.match(csvRes.headers.get('content-type') || '', /text\/csv/);
+  const csvText = await csvRes.text();
+  assert.match(csvText, /trial_index,seed,linucb_total,baseline_total,regret/);
+  assert.ok(csvText.split('\n').length > created.data.config.n_trials, 'satu baris per trial + ringkasan');
+  assert.match(csvText, new RegExp(`avg_regret,${created.data.avg_regret}`));
+
+  const jsonRes = await fetch(`${base}/api/cmab/evaluations/${id}/export?format=json`, { headers: { Authorization: `Bearer ${tokenA}` } });
+  assert.equal(jsonRes.status, 200);
+  const jsonBody = await jsonRes.json();
+  assert.equal(jsonBody.id, id);
+  assert.equal(jsonBody.trials.length, created.data.config.n_trials);
+  assert.equal(jsonBody.linucb.mean_total, created.data.linucb.mean_total);
+
+  assert.equal((await fetch(`${base}/api/cmab/evaluations/${id}/export`)).status, 401);
+});
+
+/* ───────────────────────── tiga template sebagai arm ───────────────────────── */
+
+test('tiga template menjadi tiga arm: recommend & performance mencakup ketiganya', async () => {
+  const templateA3 = await createTemplate(tokenA, 'Template Ketiga');
+  const rec = await call('POST', '/api/cmab/recommend', { token: tokenA });
+  assert.equal(rec.status, 200, JSON.stringify(rec.data));
+  assert.equal(rec.data.scores.length, 3, 'ketiga template jadi arm (scores.length === 3)');
+  assert.ok(rec.data.scores.some((s) => s.template_id === templateA3), 'template ketiga ikut dievaluasi sebagai arm');
+
+  const { rows } = await pool.query('SELECT template_id FROM cmab_models WHERE user_id=$1 ORDER BY template_id', [idA]);
+  assert.ok(rows.some((r) => r.template_id === templateA3), 'model (arm) dibuat lazy untuk template ketiga');
+
+  const perf = await call('GET', '/api/cmab/performance', { token: tokenA });
+  assert.equal(perf.data.performance.length, 3);
 });

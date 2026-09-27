@@ -1,8 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Brain, Sparkles, FlaskConical, History, ChevronLeft, ChevronRight, Loader2 } from "lucide-react";
-import { api } from "@/lib/api";
+import { Brain, Sparkles, FlaskConical, History, ChevronLeft, ChevronRight, Loader2, Download, Info } from "lucide-react";
+import { api, getToken } from "@/lib/api";
 import DashboardLayout from "@/components/DashboardLayout";
 import PageHeader from "@/components/ui/PageHeader";
 import StatCard from "@/components/ui/StatCard";
@@ -17,12 +17,37 @@ import {
   type Pagination,
   type CmabRewardPoint,
   type CmabEvaluationResult,
+  type CmabEvaluationConfig,
+  type CmabEvaluationSummary,
 } from "@/lib/cmab";
 
 const DECISIONS_PER_PAGE = 10;
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
 
 function pct(v: number | null) {
   return v == null ? "—" : `${Math.round(v * 100)}%`;
+}
+
+function fmt(v: number) {
+  return v.toFixed(3);
+}
+
+/** Unduh file dari endpoint export CMAB (butuh Authorization header, jadi tidak bisa <a href> polos). */
+async function downloadEvaluation(id: number, format: "csv" | "json") {
+  const token = getToken();
+  const res = await fetch(`${API_BASE}/api/cmab/evaluations/${id}/export?format=${format}`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
+  if (!res.ok) return;
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `cmab-evaluation-${id}.${format}`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }
 
 export default function CmabPage() {
@@ -36,9 +61,16 @@ export default function CmabPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  const [evalConfig, setEvalConfig] = useState<CmabEvaluationConfig | null>(null);
+  const [showSchema, setShowSchema] = useState(false);
+  const [alphaInput, setAlphaInput] = useState("");
+  const [nContextsInput, setNContextsInput] = useState("");
+  const [nTrialsInput, setNTrialsInput] = useState("");
+  const [seedInput, setSeedInput] = useState("");
   const [evalResult, setEvalResult] = useState<CmabEvaluationResult | null>(null);
   const [evalRunning, setEvalRunning] = useState(false);
   const [evalError, setEvalError] = useState<string | null>(null);
+  const [evalHistory, setEvalHistory] = useState<CmabEvaluationSummary[] | null>(null);
 
   useEffect(() => {
     async function load() {
@@ -77,12 +109,41 @@ export default function CmabPage() {
     loadDecisions();
   }, [decisionsPage]);
 
+  useEffect(() => {
+    async function loadEvalConfig() {
+      try {
+        const cfg = await api.get<CmabEvaluationConfig>("/api/cmab/evaluation-config");
+        setEvalConfig(cfg);
+      } catch {
+        // dokumentasi opsional — tombol Jalankan Simulasi tetap berfungsi dengan default
+      }
+    }
+    loadEvalConfig();
+  }, []);
+
+  async function loadEvalHistory() {
+    try {
+      const r = await api.get<{ evaluations: CmabEvaluationSummary[] }>("/api/cmab/evaluations", { params: { limit: 5 } });
+      setEvalHistory(r.evaluations);
+    } catch {
+      // riwayat opsional
+    }
+  }
+
+  useEffect(() => { loadEvalHistory(); }, []);
+
   async function runSimulation() {
     setEvalRunning(true);
     setEvalError(null);
     try {
-      const r = await api.post<CmabEvaluationResult>("/api/cmab/evaluate", { n_contexts: 200 });
+      const body: Record<string, number> = {};
+      if (alphaInput.trim()) body.alpha = Number(alphaInput);
+      if (nContextsInput.trim()) body.n_contexts = Number(nContextsInput);
+      if (nTrialsInput.trim()) body.n_trials = Number(nTrialsInput);
+      if (seedInput.trim()) body.seed = Number(seedInput);
+      const r = await api.post<CmabEvaluationResult>("/api/cmab/evaluate", body);
       setEvalResult(r);
+      loadEvalHistory();
     } catch (err: any) {
       setEvalError(err?.body?.error || "Simulasi gagal dijalankan");
     } finally {
@@ -280,50 +341,182 @@ export default function CmabPage() {
 
             {/* Evaluation mode — Data Simulasi, terpisah tegas dari performa nyata di atas */}
             <div className="rounded-2xl border-2 border-dashed border-violet-300 bg-violet-50/50 p-5">
-              <div className="flex items-center justify-between mb-1">
+              <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
                 <div className="flex items-center gap-2">
                   <FlaskConical size={16} className="text-violet-600" />
                   <p className="text-sm font-semibold text-violet-900">Evaluation Mode</p>
                   <span className="text-[10px] px-2 py-0.5 rounded-full bg-violet-600 text-white font-semibold tracking-wide">DATA SIMULASI</span>
                 </div>
-                <button onClick={runSimulation} disabled={evalRunning}
-                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-violet-600 rounded-xl hover:bg-violet-700 disabled:opacity-50 transition-all">
-                  {evalRunning ? <Loader2 size={13} className="animate-spin" /> : <FlaskConical size={13} />}
-                  {evalRunning ? "Menjalankan…" : "Jalankan Simulasi"}
-                </button>
               </div>
               <p className="text-xs text-violet-700 mb-4">
-                Bukan data kampanye nyata — 200 context sintetis & 3 arm sintetis dipakai untuk membandingkan LinUCB dengan
-                strategi statis (memilih template favorit tanpa mempertimbangkan context). Tidak menyentuh template atau
-                model CMAB Anda yang sesungguhnya.
+                Bukan data kampanye nyata — context & 3 arm (Informatif/Persuasif/Urgency) SINTETIS dipakai untuk
+                membandingkan LinUCB dengan strategi statis (memilih template favorit tanpa mempertimbangkan context).
+                Tidak pernah menulis ke template atau model CMAB Anda yang sesungguhnya.
               </p>
+
+              {/* Dokumentasi: mapping context vector, mekanisme arm/reward, definisi baseline & regret */}
+              {evalConfig && (
+                <div className="bg-white/70 rounded-xl p-4 mb-4 text-xs text-violet-900 space-y-2">
+                  <button onClick={() => setShowSchema((v) => !v)} className="flex items-center gap-1.5 font-semibold hover:underline">
+                    <Info size={13} /> Context vector: {evalConfig.context_schema.dimension} dimensi ({showSchema ? "sembunyikan" : "lihat"} mapping & encoding)
+                  </button>
+                  {showSchema && (
+                    <div className="overflow-x-auto max-h-56 overflow-y-auto border border-violet-100 rounded-lg mt-2">
+                      <table className="w-full text-[11px]">
+                        <thead className="sticky top-0 bg-violet-50">
+                          <tr className="text-violet-700">
+                            <th className="text-left font-medium py-1.5 px-2">Idx</th>
+                            <th className="text-left font-medium py-1.5 px-2">Kelompok</th>
+                            <th className="text-left font-medium py-1.5 px-2">Label</th>
+                            <th className="text-left font-medium py-1.5 px-2">Encoding</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {evalConfig.context_schema.dims.map((d) => (
+                            <tr key={d.index} className="border-t border-violet-50">
+                              <td className="py-1 px-2 text-violet-500">{d.index}</td>
+                              <td className="py-1 px-2">{d.group}</td>
+                              <td className="py-1 px-2">{d.label}</td>
+                              <td className="py-1 px-2 text-violet-600">{d.encoding}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                  <p className="pt-1">
+                    <strong>Mekanisme:</strong> tiap arm sintetis punya rate dasar delivered/read/replied yang{" "}
+                    <strong>sama persis</strong> di ketiga arm, plus bonus bila jam pengiriman & audience context cocok
+                    dengan preferensinya — supaya keunggulan hanya bisa didapat dengan benar-benar memakai context.
+                  </p>
+                  <p><strong>Reward simulasi:</strong> {evalConfig.reward_formula.simulation} ({evalConfig.reward_formula.production})</p>
+                  <p><strong>Baseline statis:</strong> {evalConfig.baseline_definition}</p>
+                  <p><strong>Regret:</strong> {evalConfig.regret_formula}</p>
+                </div>
+              )}
+
+              {/* Parameter simulasi */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-3">
+                <label className="text-[11px] text-violet-700 font-medium">
+                  Alpha
+                  <input type="number" step="0.05" min="0" max="5" value={alphaInput}
+                    onChange={(e) => setAlphaInput(e.target.value)}
+                    placeholder={evalConfig ? String(evalConfig.default_alpha) : "0.3"}
+                    className="mt-1 w-full rounded-lg border border-violet-200 px-2 py-1.5 text-xs text-ink" />
+                </label>
+                <label className="text-[11px] text-violet-700 font-medium">
+                  Jumlah context
+                  <input type="number" min={evalConfig?.bounds.min_contexts ?? 100} max={evalConfig?.bounds.max_contexts ?? 300} value={nContextsInput}
+                    onChange={(e) => setNContextsInput(e.target.value)}
+                    placeholder={String(evalConfig?.bounds.min_contexts ?? 100)}
+                    className="mt-1 w-full rounded-lg border border-violet-200 px-2 py-1.5 text-xs text-ink" />
+                </label>
+                <label className="text-[11px] text-violet-700 font-medium">
+                  Jumlah percobaan (≥{evalConfig?.bounds.min_trials ?? 30})
+                  <input type="number" min={evalConfig?.bounds.min_trials ?? 30} max={evalConfig?.bounds.max_trials ?? 60} value={nTrialsInput}
+                    onChange={(e) => setNTrialsInput(e.target.value)}
+                    placeholder={String(evalConfig?.bounds.min_trials ?? 30)}
+                    className="mt-1 w-full rounded-lg border border-violet-200 px-2 py-1.5 text-xs text-ink" />
+                </label>
+                <label className="text-[11px] text-violet-700 font-medium">
+                  Seed (opsional)
+                  <input type="number" value={seedInput} onChange={(e) => setSeedInput(e.target.value)}
+                    placeholder="acak"
+                    className="mt-1 w-full rounded-lg border border-violet-200 px-2 py-1.5 text-xs text-ink" />
+                </label>
+              </div>
+              <button onClick={runSimulation} disabled={evalRunning}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-violet-600 rounded-xl hover:bg-violet-700 disabled:opacity-50 transition-all mb-4">
+                {evalRunning ? <Loader2 size={13} className="animate-spin" /> : <FlaskConical size={13} />}
+                {evalRunning ? "Menjalankan… (bisa sampai ~20 detik)" : "Jalankan Simulasi"}
+              </button>
+
               {evalError && <div className="bg-red-50 border border-red-200 text-red-700 text-xs rounded-xl px-4 py-2 mb-3">{evalError}</div>}
+
               {evalResult ? (
                 <div className="space-y-4">
+                  <p className="text-[11px] text-violet-700">
+                    Konfigurasi: alpha={evalResult.config.alpha}, {evalResult.config.n_contexts} context/trial,{" "}
+                    {evalResult.config.n_trials} trial, seed={evalResult.config.seed}
+                  </p>
                   <RewardCurveChart
                     xLabel="Context ke-"
                     series={[
-                      { label: "LinUCB (kontekstual)", color: "#7C3AED", values: evalResult.linucb_cumulative_reward },
-                      { label: "Baseline statis", color: "#9CA3AF", values: evalResult.baseline_cumulative_reward },
+                      { label: "LinUCB (kontekstual)", color: "#7C3AED", values: evalResult.linucb.cumulative_avg_curve },
+                      { label: "Baseline statis", color: "#9CA3AF", values: evalResult.baseline.cumulative_avg_curve },
                     ]}
                   />
-                  <div className="grid grid-cols-3 gap-3 text-center">
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-center">
                     <div className="bg-white/70 rounded-xl p-3">
-                      <p className="text-[11px] text-violet-700 font-medium">Total Reward LinUCB</p>
-                      <p className="text-lg font-bold text-violet-900">{evalResult.linucb_total.toFixed(2)}</p>
+                      <p className="text-[11px] text-violet-700 font-medium">LinUCB (mean ± std, {evalResult.config.n_trials} trial)</p>
+                      <p className="text-lg font-bold text-violet-900">{fmt(evalResult.linucb.mean_total)} ± {fmt(evalResult.linucb.std_total)}</p>
+                      <p className="text-[10px] text-violet-600">CI95 [{fmt(evalResult.linucb.ci95[0])}, {fmt(evalResult.linucb.ci95[1])}]</p>
                     </div>
                     <div className="bg-white/70 rounded-xl p-3">
-                      <p className="text-[11px] text-violet-700 font-medium">Total Reward Baseline</p>
-                      <p className="text-lg font-bold text-violet-900">{evalResult.baseline_total.toFixed(2)}</p>
+                      <p className="text-[11px] text-violet-700 font-medium">Baseline (mean ± std)</p>
+                      <p className="text-lg font-bold text-violet-900">{fmt(evalResult.baseline.mean_total)} ± {fmt(evalResult.baseline.std_total)}</p>
+                      <p className="text-[10px] text-violet-600">CI95 [{fmt(evalResult.baseline.ci95[0])}, {fmt(evalResult.baseline.ci95[1])}]</p>
                     </div>
                     <div className="bg-white/70 rounded-xl p-3">
-                      <p className="text-[11px] text-violet-700 font-medium">Regret (LinUCB)</p>
-                      <p className="text-lg font-bold text-violet-900">{evalResult.regret.toFixed(2)}</p>
+                      <p className="text-[11px] text-violet-700 font-medium">Peningkatan LinUCB</p>
+                      <p className={`text-lg font-bold ${(evalResult.improvement_pct ?? 0) >= 0 ? "text-violet-900" : "text-red-600"}`}>
+                        {evalResult.improvement_pct != null ? `${evalResult.improvement_pct >= 0 ? "+" : ""}${evalResult.improvement_pct.toFixed(1)}%` : "—"}
+                      </p>
                     </div>
+                    <div className="bg-white/70 rounded-xl p-3 col-span-2 sm:col-span-3">
+                      <p className="text-[11px] text-violet-700 font-medium">Rata-rata regret di seluruh percobaan</p>
+                      <p className="text-lg font-bold text-violet-900">{fmt(evalResult.avg_regret)} ± {fmt(evalResult.std_regret)}</p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <button onClick={() => downloadEvaluation(evalResult.id, "csv")}
+                      className="flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-semibold text-violet-700 bg-white rounded-lg border border-violet-200 hover:bg-violet-50">
+                      <Download size={12} /> Unduh CSV
+                    </button>
+                    <button onClick={() => downloadEvaluation(evalResult.id, "json")}
+                      className="flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-semibold text-violet-700 bg-white rounded-lg border border-violet-200 hover:bg-violet-50">
+                      <Download size={12} /> Unduh JSON
+                    </button>
                   </div>
                 </div>
               ) : (
                 <p className="text-xs text-violet-600">Belum ada hasil simulasi pada sesi ini — klik &quot;Jalankan Simulasi&quot;.</p>
+              )}
+
+              {/* Riwayat evaluasi */}
+              {evalHistory && evalHistory.length > 0 && (
+                <div className="mt-5 pt-4 border-t border-violet-200">
+                  <p className="text-xs font-semibold text-violet-900 mb-2">Riwayat Simulasi (5 terakhir)</p>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-[11px]">
+                      <thead>
+                        <tr className="text-violet-700">
+                          <th className="text-left font-medium py-1.5 pr-2">Waktu</th>
+                          <th className="text-right font-medium py-1.5 px-2">Trial</th>
+                          <th className="text-right font-medium py-1.5 px-2">LinUCB</th>
+                          <th className="text-right font-medium py-1.5 px-2">Baseline</th>
+                          <th className="text-right font-medium py-1.5 px-2">Peningkatan</th>
+                          <th className="text-right font-medium py-1.5 pl-2">Unduh</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {evalHistory.map((ev) => (
+                          <tr key={ev.id} className="border-t border-violet-100">
+                            <td className="py-1.5 pr-2 text-violet-800 whitespace-nowrap">{new Date(ev.created_at || "").toLocaleString("id-ID")}</td>
+                            <td className="py-1.5 px-2 text-right text-violet-800">{ev.config.n_trials}</td>
+                            <td className="py-1.5 px-2 text-right text-violet-800">{fmt(ev.linucb.mean_total)}</td>
+                            <td className="py-1.5 px-2 text-right text-violet-800">{fmt(ev.baseline.mean_total)}</td>
+                            <td className="py-1.5 px-2 text-right text-violet-800">{ev.improvement_pct != null ? `${ev.improvement_pct.toFixed(1)}%` : "—"}</td>
+                            <td className="py-1.5 pl-2 text-right">
+                              <button onClick={() => downloadEvaluation(ev.id, "csv")} className="text-violet-600 hover:underline">CSV</button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
               )}
             </div>
 

@@ -14,15 +14,25 @@
  * Kontak yang gagal/pending tidak masuk hitungan manapun → otomatis
  * berkontribusi 0, sesuai spec ("jika gagal dikirim, reward = 0").
  */
+// Bobot formula — satu sumber kebenaran. evaluate.js (Evaluation Mode) memakai WEIGHTS &
+// computeRewardFromRates yang SAMA PERSIS ini (bukan angka yang ditulis ulang), supaya reward
+// simulasi dijamin identik dengan reward produksi, tanpa risiko dua rumus yang diam-diam berbeda.
+const WEIGHTS = { delivered: 0.2, read: 0.3, replied: 0.5 };
+
 function computeReward(blast) {
   const T = blast.total_contacts;
   if (!T || T <= 0) return 0; // tidak ada kontak target → reward tidak terdefinisi, anggap 0
 
-  const deliveredRate = blast.delivered_count / T;
-  const readRate = blast.read_count / T;
-  const repliedRate = blast.replied_count / T;
-
-  return 0.2 * deliveredRate + 0.3 * readRate + 0.5 * repliedRate;
+  return computeRewardFromRates({
+    deliveredRate: blast.delivered_count / T,
+    readRate: blast.read_count / T,
+    repliedRate: blast.replied_count / T,
+  });
 }
 
-module.exports = { computeReward };
+/** Rumus yang sama, tapi menerima rate (0..1) langsung — dipakai oleh evaluate.js pada rate sintetis. */
+function computeRewardFromRates({ deliveredRate, readRate, repliedRate }) {
+  return WEIGHTS.delivered * deliveredRate + WEIGHTS.read * readRate + WEIGHTS.replied * repliedRate;
+}
+
+module.exports = { computeReward, computeRewardFromRates, WEIGHTS };

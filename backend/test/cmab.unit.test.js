@@ -8,7 +8,11 @@ const assert = require('node:assert/strict');
 const { initModel, computeUcbScore, selectArm, updateModel, invert } = require('../src/cmab/linucb');
 const { buildContext, DIMENSION, hourBucket, hashToBucket } = require('../src/cmab/context');
 const { computeReward } = require('../src/cmab/reward');
-const { runEvaluation, generateContexts, buildSyntheticArms, expectedReward, MIN_CONTEXTS, MAX_CONTEXTS } = require('../src/cmab/evaluate');
+const {
+  runEvaluation, getEvaluationConfig, generateContexts, buildSyntheticArms, expectedReward, expectedRates, drawRates,
+  MIN_CONTEXTS, MAX_CONTEXTS, MIN_TRIALS, MAX_TRIALS,
+} = require('../src/cmab/evaluate');
+const { WEIGHTS: REWARD_WEIGHTS, computeRewardFromRates } = require('../src/cmab/reward');
 
 /* ───────────── linucb: cold start & dasar ───────────── */
 
@@ -201,51 +205,109 @@ test('generateContexts: deterministik ber-seed, jumlah sesuai, dalam rentang val
   assert.notDeepEqual(a, c2, 'seed beda -> context berbeda');
 });
 
-test('buildSyntheticArms: 3 arm, preferensi tetap, tidak menyentuh template asli', () => {
+test('buildSyntheticArms: 3 arm (Informatif/Persuasif/Urgency), base rate SAMA (hanya preferensi context beda), tidak menyentuh template asli', () => {
   const arms = buildSyntheticArms();
   assert.equal(arms.length, 3);
   assert.deepEqual(arms.map((a) => a.id), [0, 1, 2]);
-  assert.ok(arms.every((a) => a.name.startsWith('Simulasi')));
-  assert.ok(new Set(arms.map((a) => a.preferred_hour_bucket)).size >= 2, 'preferensi jam bervariasi antar arm');
+  assert.deepEqual(arms.map((a) => a.name), ['Informatif', 'Persuasif', 'Urgency']);
+  assert.ok(new Set(arms.map((a) => a.preferred_hour_bucket)).size === 3, 'preferensi jam berbeda per arm');
+  assert.ok(new Set(arms.map((a) => a.preferred_audience_bucket)).size === 3, 'preferensi audience berbeda per arm');
+  for (const f of ['base_delivered', 'base_read', 'base_replied']) {
+    const values = new Set(arms.map((a) => a[f]));
+    assert.equal(values.size, 1, `${f} harus identik di ketiga arm (fairness vs baseline)`);
+  }
 });
 
-test('expectedReward: arm mendapat bonus saat bucket jam/audience favoritnya cocok', () => {
+test('expectedRates/expectedReward: arm mendapat bonus saat bucket jam/audience favoritnya cocok; reward memakai bobot produksi', () => {
   const arms = buildSyntheticArms();
   const arm = arms[0];
+  const match = expectedRates(arm, arm.preferred_hour_bucket, arm.preferred_audience_bucket);
+  const noMatch = expectedRates(arm, (arm.preferred_hour_bucket + 1) % 4, (arm.preferred_audience_bucket + 1) % 7);
+  assert.ok(match.readRate > noMatch.readRate, 'jam cocok -> read_rate naik');
+  assert.ok(match.repliedRate > noMatch.repliedRate, 'audience cocok -> replied_rate naik');
+  for (const r of [match, noMatch]) for (const v of Object.values(r)) assert.ok(v >= 0 && v <= 1);
+
   const withMatch = expectedReward(arm, arm.preferred_hour_bucket, arm.preferred_audience_bucket);
-  const noMatch = expectedReward(arm, (arm.preferred_hour_bucket + 1) % 4, (arm.preferred_audience_bucket + 1) % 7);
-  assert.ok(withMatch > noMatch, 'bucket favorit harus menghasilkan expected reward lebih tinggi');
-  assert.ok(withMatch <= 1 && noMatch >= 0, 'reward tetap dalam rentang [0,1]');
+  const withoutMatch = expectedReward(arm, (arm.preferred_hour_bucket + 1) % 4, (arm.preferred_audience_bucket + 1) % 7);
+  assert.ok(withMatch > withoutMatch, 'bucket favorit harus menghasilkan expected reward lebih tinggi');
+  // reward = computeRewardFromRates dengan bobot 0.2/0.3/0.5 yang SAMA dengan produksi — bukan rumus terpisah
+  assert.ok(Math.abs(withMatch - computeRewardFromRates(match)) < 1e-9);
 });
 
-test('runEvaluation: minimal 100 context, 3 arm sintetis, dua kurva sepanjang n_contexts, deterministik', () => {
+test('drawRates: realisasi ber-noise tetap dalam [0,1], dan reproducible untuk RNG (seed) yang sama', () => {
+  const arm = buildSyntheticArms()[0];
+  const lcg = (seed) => { let s = seed >>> 0; return () => { s = (s * 48271) % 2147483647; return s / 2147483647; }; };
+
+  const r1 = drawRates(arm, 1, 0, lcg(99));
+  for (const v of Object.values(r1)) assert.ok(v >= 0 && v <= 1);
+
+  const r2 = drawRates(arm, 1, 0, lcg(99));
+  assert.deepEqual(r1, r2, 'RNG (seed) sama -> rate hasil draw identik');
+});
+
+test('runEvaluation: minimal 30 trial (default), 3 arm sintetis, statistik lengkap, deterministik dari seed', () => {
   const r = runEvaluation({ n_contexts: 100, seed: 7 });
-  assert.equal(r.n_contexts, 100);
+  assert.equal(r.config.n_contexts, 100);
+  assert.ok(r.config.n_trials >= MIN_TRIALS, 'default n_trials >= 30');
+  assert.equal(r.trials.length, r.config.n_trials);
   assert.equal(r.arms.length, 3);
-  assert.equal(r.linucb_cumulative_reward.length, 100);
-  assert.equal(r.baseline_cumulative_reward.length, 100);
-  assert.equal(typeof r.linucb_total, 'number');
-  assert.equal(typeof r.baseline_total, 'number');
-  assert.ok(r.regret >= 0, 'regret (jarak ke arm optimal) tidak boleh negatif');
-  for (const v of [...r.linucb_cumulative_reward, ...r.baseline_cumulative_reward]) {
+  assert.equal(r.linucb.cumulative_avg_curve.length, 100);
+  assert.equal(r.baseline.cumulative_avg_curve.length, 100);
+  assert.equal(typeof r.linucb.mean_total, 'number');
+  assert.equal(typeof r.linucb.std_total, 'number');
+  assert.equal(r.linucb.ci95.length, 2);
+  assert.ok(r.linucb.ci95[0] <= r.linucb.mean_total && r.linucb.mean_total <= r.linucb.ci95[1]);
+  assert.ok(r.avg_regret >= 0, 'rata-rata regret tidak boleh negatif');
+  assert.ok(r.std_regret >= 0);
+  assert.equal(typeof r.improvement_pct, 'number');
+  for (const t of r.trials) {
+    assert.equal(typeof t.linucb_total, 'number');
+    assert.equal(typeof t.baseline_total, 'number');
+    assert.ok(t.regret >= 0);
+  }
+  for (const v of [...r.linucb.cumulative_avg_curve, ...r.baseline.cumulative_avg_curve]) {
     assert.ok(v >= 0 && v <= 1.1, `kurva reward kumulatif ${v} harus mendekati rentang [0,1]`);
   }
 
   const again = runEvaluation({ n_contexts: 100, seed: 7 });
-  assert.deepEqual(r.linucb_cumulative_reward, again.linucb_cumulative_reward, 'seed sama -> hasil reproducible (bukti untuk laporan)');
-  assert.equal(r.linucb_total, again.linucb_total);
+  assert.deepEqual(r.linucb.cumulative_avg_curve, again.linucb.cumulative_avg_curve, 'seed sama -> hasil reproducible (bukti untuk laporan)');
+  assert.equal(r.linucb.mean_total, again.linucb.mean_total);
+  assert.deepEqual(r.trials.map((t) => t.seed), again.trials.map((t) => t.seed));
 });
 
-test('runEvaluation: n_contexts di-clamp ke [MIN_CONTEXTS, MAX_CONTEXTS]', () => {
-  assert.equal(runEvaluation({ n_contexts: 10, seed: 1 }).n_contexts, MIN_CONTEXTS);
-  assert.equal(runEvaluation({ n_contexts: 5000, seed: 1 }).n_contexts, MAX_CONTEXTS);
-  assert.equal(runEvaluation({ seed: 1 }).n_contexts, MIN_CONTEXTS, 'default juga >= 100');
+test('runEvaluation: n_contexts & n_trials di-clamp ke batas [MIN,MAX] masing-masing; alpha di-clamp ke [0,5]', () => {
+  assert.equal(runEvaluation({ n_contexts: 10, seed: 1 }).config.n_contexts, MIN_CONTEXTS);
+  assert.equal(runEvaluation({ n_contexts: 999999, seed: 1 }).config.n_contexts, MAX_CONTEXTS);
+  assert.equal(runEvaluation({ seed: 1 }).config.n_contexts, MIN_CONTEXTS, 'default juga >= 100');
+
+  assert.equal(runEvaluation({ n_contexts: 100, n_trials: 1, seed: 1 }).config.n_trials, MIN_TRIALS, 'n_trials < 30 -> dipaksa minimal 30');
+  assert.equal(runEvaluation({ n_contexts: 100, n_trials: 99999, seed: 1 }).config.n_trials, MAX_TRIALS);
+
+  assert.equal(runEvaluation({ n_contexts: 100, n_trials: 30, alpha: -5, seed: 1 }).config.alpha, 0);
+  assert.equal(runEvaluation({ n_contexts: 100, n_trials: 30, alpha: 999, seed: 1 }).config.alpha, 5);
 });
 
-test('runEvaluation: LinUCB (pakai context) mengungguli baseline statis (context-blind) setelah cukup observasi', () => {
-  const r = runEvaluation({ n_contexts: 400, seed: 2024 });
+test('runEvaluation: LinUCB (pakai context) mengungguli baseline statis (context-blind) secara konsisten di seluruh trial', () => {
+  const r = runEvaluation({ n_contexts: 150, n_trials: 30, seed: 2024 });
   assert.ok(
-    r.linucb_cumulative_reward.at(-1) > r.baseline_cumulative_reward.at(-1),
-    `LinUCB (${r.linucb_cumulative_reward.at(-1)}) harus mengungguli baseline (${r.baseline_cumulative_reward.at(-1)}) karena arm sintetis punya preferensi context yang bisa dipelajari`
+    r.linucb.mean_total > r.baseline.mean_total,
+    `LinUCB (${r.linucb.mean_total}) harus mengungguli baseline (${r.baseline.mean_total}) — base rate arm dibuat SAMA, jadi keunggulan hanya bisa datang dari pemakaian context`
   );
+  assert.ok(r.improvement_pct > 0, `improvement_pct harus positif, got ${r.improvement_pct}`);
+  // CI95 tidak boleh tumpang tindih terlalu jauh dari mean lawannya — bukti keunggulan bukan kebetulan
+  assert.ok(r.linucb.ci95[0] > r.baseline.mean_total - r.baseline.std_total * 3, 'keunggulan LinUCB masuk akal secara statistik');
+});
+
+test('getEvaluationConfig: dimensi context 19, 3 arm, rumus reward sama persis dengan produksi, definisi baseline & regret ada', () => {
+  const cfg = getEvaluationConfig();
+  assert.equal(cfg.context_schema.dimension, 19);
+  assert.equal(cfg.context_schema.dims.length, 19);
+  assert.equal(cfg.arms.length, 3);
+  assert.deepEqual(cfg.reward_formula.weights, REWARD_WEIGHTS);
+  assert.ok(cfg.baseline_definition.length > 20);
+  assert.ok(cfg.regret_formula.length > 20);
+  assert.equal(cfg.bounds.min_trials, MIN_TRIALS);
+  assert.equal(cfg.bounds.max_trials, MAX_TRIALS);
+  assert.equal(cfg.bounds.min_contexts, MIN_CONTEXTS);
+  assert.equal(cfg.bounds.max_contexts, MAX_CONTEXTS);
 });
